@@ -1,0 +1,9 @@
+{
+  "browser": "safari",
+  "obsidian": {
+    "vault": "~/Documents/My Vault",
+    "notes": "kakera",
+    "attachments": "attachments",
+    "inbox": "kakera/inbox.md"
+  }
+}

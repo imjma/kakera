@@ -1,0 +1,9 @@
+#!/bin/sh
+script="$(dirname "$(realpath "$0")")/kakera.py"
+case "${1:-}" in
+  local) shift; exec uv run "$script" "$@" ;;
+  inbox) shift; exec uv run "$script" --inbox "$@" ;;
+  instagram-cookies) shift; exec uv run "$script" --instagram-cookies "$@" ;;
+  reddit-oauth) shift; exec uv run "$script" --reddit-oauth "$@" ;;
+  *) exec uv run "$script" --obsidian "$@" ;;
+esac
