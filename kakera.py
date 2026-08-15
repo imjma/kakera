@@ -14,9 +14,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 
@@ -36,6 +37,9 @@ TRACKING_PARAMETERS = {
     "utm_source",
     "utm_term",
 }
+INBOX_TASK = re.compile(r"^\s*-\s+\[ \]\s+(https?://\S+)")
+HTTP_URL = re.compile(r"https?://[^\s<>\[\]\"']+")
+TODOIST_API = "https://api.todoist.com/api/v1"
 
 
 def canonical_url(url: str) -> str:
@@ -237,6 +241,122 @@ def configured_folders() -> tuple[Path, Path]:
 
 def configured_inbox() -> Path:
     return configured_paths("inbox")[0]
+
+
+def configured_todoist_project() -> str:
+    todoist = read_config().get("todoist")
+    if not isinstance(todoist, dict):
+        raise ValueError(f"invalid {CONFIG.name}: todoist must be an object")
+    project_id = todoist.get("project_id")
+    if not isinstance(project_id, (str, int)) or not str(project_id).strip():
+        raise ValueError(f"invalid {CONFIG.name}: todoist.project_id must be set")
+    return str(project_id)
+
+
+def todoist_token() -> str:
+    token = os.environ.get("TODOIST_API_TOKEN", "").strip()
+    if not token:
+        raise ValueError("TODOIST_API_TOKEN is not set")
+    return token
+
+
+def todoist_request(token: str, path: str, method: str = "GET") -> dict | None:
+    request = Request(
+        f"{TODOIST_API}{path}",
+        headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
+        method=method,
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            body = response.read()
+    except OSError as error:
+        raise ValueError(f"Todoist request failed: {error}") from error
+    if not body:
+        return {}
+    try:
+        result = json.loads(body)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("Todoist returned invalid JSON") from error
+    if result is None and method == "POST":
+        return None
+    if not isinstance(result, dict):
+        raise ValueError("Todoist returned an invalid response")
+    return result
+
+
+def todoist_tasks(token: str, project_id: str):
+    cursor = None
+    while True:
+        query = {"project_id": project_id}
+        if cursor:
+            query["cursor"] = cursor
+        result = todoist_request(token, f"/tasks?{urlencode(query)}")
+        tasks = result.get("results")
+        if not isinstance(tasks, list):
+            raise ValueError("Todoist returned an invalid task list")
+        yield from tasks
+        cursor = result.get("next_cursor")
+        if not cursor:
+            return
+
+
+def task_url(task: dict) -> str | None:
+    for field in ("content", "description"):
+        value = task.get(field)
+        if isinstance(value, str):
+            match = HTTP_URL.search(value)
+            if match:
+                return match.group(0).rstrip(".,!?;:)]}")
+    return None
+
+
+def process_todoist(
+    browser: str | None,
+    notes: Path,
+    attachments: Path,
+    account: str | None = None,
+) -> int:
+    token = todoist_token()
+    project_id = configured_todoist_project()
+    failed = False
+    for task in todoist_tasks(token, project_id):
+        if not isinstance(task, dict):
+            raise ValueError("Todoist returned an invalid task")
+        url = task_url(task)
+        if not url:
+            print(f"ok: skipped Todoist task {task.get('id', '?')}: no HTTP(S) URL")
+            continue
+        success, message = save(url, browser, notes, attachments, account)
+        print(f"{'ok' if success else 'error'}: {url}: {message}")
+        if not success:
+            failed = True
+            continue
+        try:
+            todoist_request(token, f"/tasks/{quote(str(task.get('id', '')), safe='')}/close", "POST")
+        except ValueError as error:
+            print(f"error: Todoist task {task.get('id', '?')} was saved but not closed: {error}", file=sys.stderr)
+            failed = True
+    return int(failed)
+
+
+def watch_todoist(
+    browser: str | None,
+    notes: Path,
+    attachments: Path,
+    account: str | None = None,
+    interval: float = 30,
+) -> int:
+    print("ok: watching Todoist")
+    try:
+        while True:
+            try:
+                process_todoist(browser, notes, attachments, account)
+            except (OSError, ValueError) as error:
+                print(f"error: {error}", file=sys.stderr)
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("ok: stopped watching Todoist")
+        return 0
 
 
 def image_extension(path: Path) -> str | None:
@@ -541,6 +661,8 @@ def process_inbox(
     notes: Path,
     attachments: Path,
     account: str | None = None,
+    completed: set[str] | None = None,
+    report_empty: bool = True,
 ) -> int:
     if not inbox.exists():
         inbox.parent.mkdir(parents=True, exist_ok=True)
@@ -548,8 +670,29 @@ def process_inbox(
         print(f"ok: created {inbox}")
         return 0
 
+    completed = completed if completed is not None else set()
+    failed = mark_completed(inbox, completed)
+    attempted = set(completed)
+    pending = pending_urls(inbox)
+    if not pending and report_empty:
+        print("ok: no pending links")
+        return int(failed)
+
+    while url := next((url for url in pending if url not in attempted), None):
+        attempted.add(url)
+        success, message = save(url, browser, notes, attachments, account)
+        print(f"{'ok' if success else 'error'}: {url}: {message}")
+        if success:
+            completed.add(url)
+            failed |= mark_completed(inbox, completed)
+        failed |= not success
+        pending = pending_urls(inbox)
+    return int(failed)
+
+
+def read_inbox(inbox: Path) -> str:
     try:
-        lines = inbox.read_text().splitlines(keepends=True)
+        return inbox.read_text()
     except OSError as error:
         if error.errno == errno.EPERM:
             raise ValueError(
@@ -558,33 +701,83 @@ def process_inbox(
                 "Drive path visible in Finder"
             ) from error
         raise
-    pending = [
-        (index, match.group(1))
-        for index, line in enumerate(lines)
-        if (match := re.match(r"^\s*-\s+\[ \]\s+(https?://\S+)", line))
-    ]
-    if not pending:
-        print("ok: no pending links")
-        return 0
 
+
+def pending_urls(inbox: Path) -> list[str]:
+    return list(dict.fromkeys(
+        match.group(1)
+        for line in read_inbox(inbox).splitlines()
+        if (match := INBOX_TASK.match(line))
+    ))
+
+
+def mark_completed(inbox: Path, completed: set[str]) -> bool:
     failed = False
-    for index, url in pending:
-        success, message = save(url, browser, notes, attachments, account)
-        print(f"{'ok' if success else 'error'}: {url}: {message}")
-        if success:
-            lines[index] = lines[index].replace("[ ]", "[x]", 1)
-            temporary = inbox.with_suffix(inbox.suffix + ".tmp")
-            temporary.write_text("".join(lines))
-            replace_text(temporary, inbox)
-        failed |= not success
-    return int(failed)
+    for url in tuple(completed):
+        try:
+            original = read_inbox(inbox)
+            lines = original.splitlines(keepends=True)
+            updated = "".join(
+                line.replace("[ ]", "[x]", 1)
+                if (match := INBOX_TASK.match(line)) and match.group(1) == url else line
+                for line in lines
+            )
+            if updated != original:
+                temporary = inbox.with_suffix(inbox.suffix + ".tmp")
+                temporary.write_text(updated)
+                if read_inbox(inbox) != original:
+                    temporary.unlink(missing_ok=True)
+                    continue
+                replace_text(temporary, inbox)
+            completed.remove(url)
+        except (OSError, ValueError) as error:
+            print(f"error: cannot update {inbox}: {error}", file=sys.stderr)
+            failed = True
+    return failed
+
+
+def watch_inbox(
+    inbox: Path,
+    browser: str | None,
+    notes: Path,
+    attachments: Path,
+    account: str | None = None,
+    interval: float = 2,
+) -> int:
+    completed: set[str] = set()
+    if not inbox.exists():
+        process_inbox(inbox, browser, notes, attachments, account, completed, False)
+    previous: object = object()
+    reported_error = None
+    print(f"ok: watching {inbox}")
+    try:
+        while True:
+            try:
+                if not inbox.exists():
+                    previous = None
+                else:
+                    current = read_inbox(inbox)
+                    if current != previous:
+                        process_inbox(inbox, browser, notes, attachments, account, completed, False)
+                    elif completed:
+                        mark_completed(inbox, completed)
+                    previous = read_inbox(inbox)
+                reported_error = None
+            except (OSError, ValueError) as error:
+                if str(error) != reported_error:
+                    print(f"error: {error}", file=sys.stderr)
+                    reported_error = str(error)
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("ok: stopped watching inbox")
+        return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Save Instagram, Reddit, and RedNote images as Markdown captures.",
         epilog=("Shortcuts: kakera URL, kakera local URL, kakera inbox, "
-                "kakera instagram-cookies, kakera reddit-oauth"),
+                "kakera todoist, kakera instagram-cookies, kakera reddit-oauth"),
     )
     parser.add_argument("--version", action="version", version=f"Kakera {VERSION}")
     parser.add_argument("--browser", help="browser cookies to pass to gallery-dl, e.g. safari")
@@ -594,6 +787,8 @@ def main() -> int:
     )
     parser.add_argument("--obsidian", action="store_true", help=f"use folders from {CONFIG.name}")
     parser.add_argument("--inbox", action="store_true", help="process unchecked links in the Obsidian inbox")
+    parser.add_argument("--watch", action="store_true", help="keep watching the inbox or Todoist")
+    parser.add_argument("--todoist", action="store_true", help="process open Todoist tasks")
     parser.add_argument("--reddit-oauth", nargs="?", const="", metavar="USERNAME")
     parser.add_argument("urls", nargs="*")
     arguments = parser.parse_args()
@@ -618,7 +813,7 @@ def main() -> int:
     try:
         browser = arguments.browser or configured_browser()
         account = arguments.account or configured_instagram_account()
-        notes, attachments = configured_folders() if arguments.obsidian or arguments.inbox else (
+        notes, attachments = configured_folders() if arguments.obsidian or arguments.inbox or arguments.todoist else (
             ROOT / "downloads",
             ROOT / "attachments",
         )
@@ -626,12 +821,25 @@ def main() -> int:
         parser.error(str(error))
 
     if arguments.inbox:
+        if arguments.todoist:
+            parser.error("--inbox and --todoist cannot be combined")
         if arguments.urls:
             parser.error("--inbox does not accept URLs")
         try:
-            return process_inbox(configured_inbox(), browser, notes, attachments, account)
+            function = watch_inbox if arguments.watch else process_inbox
+            return function(configured_inbox(), browser, notes, attachments, account)
         except (OSError, ValueError) as error:
             parser.error(str(error))
+    if arguments.todoist:
+        if arguments.urls:
+            parser.error("--todoist does not accept URLs")
+        try:
+            function = watch_todoist if arguments.watch else process_todoist
+            return function(browser, notes, attachments, account)
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+    if arguments.watch:
+        parser.error("--watch requires --inbox or --todoist")
     if not arguments.urls:
         parser.error("provide at least one URL")
 

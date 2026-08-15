@@ -18,7 +18,9 @@ from kakera import (
     replace_text,
     parse_rednote,
     process_inbox,
+    process_todoist,
     reddit_oauth,
+    watch_inbox,
     write_note,
 )
 
@@ -178,12 +180,119 @@ with TemporaryDirectory() as directory:
 
     inbox = vault / "Kakera" / "inbox.md"
     inbox.parent.mkdir()
-    inbox.write_text("- [ ] https://www.instagram.com/p/ABC/\n- [ ] http://xhslink.com/o/failed\n")
-    with patch.object(kakera, "save", side_effect=((True, "saved"), (False, "failed"))):
+    inbox.write_text(
+        "- [ ] https://www.instagram.com/p/ABC/\n"
+        "- [ ] https://www.instagram.com/p/ABC/\n"
+        "- [ ] http://xhslink.com/o/failed\n"
+    )
+
+    def save_from_inbox(url, *_arguments):
+        if "instagram" in url:
+            inbox.write_text(inbox.read_text() + "Obsidian edit during capture\n")
+            return True, "saved"
+        return False, "failed"
+
+    with patch.object(kakera, "save", side_effect=save_from_inbox) as save:
         assert process_inbox(inbox, "orion", vault / "Clippings", vault / "assets") == 1
     assert inbox.read_text() == (
-        "- [x] https://www.instagram.com/p/ABC/\n- [ ] http://xhslink.com/o/failed\n"
+        "- [x] https://www.instagram.com/p/ABC/\n"
+        "- [x] https://www.instagram.com/p/ABC/\n"
+        "- [ ] http://xhslink.com/o/failed\n"
+        "Obsidian edit during capture\n"
     )
+    assert save.call_count == 2
+
+    watched = vault / "Kakera" / "watched.md"
+    watched.write_text("# Inbox\n")
+
+    def change_then_stop(_interval):
+        nonlocal_ticks[0] += 1
+        if nonlocal_ticks[0] == 1:
+            watched.write_text(watched.read_text() + "- [ ] https://redd.it/new\n")
+        elif nonlocal_ticks[0] == 2:
+            assert "- [x] https://redd.it/new" in watched.read_text()
+            watched.unlink()
+        else:
+            assert not watched.exists()
+            raise KeyboardInterrupt
+
+    nonlocal_ticks = [0]
+    with (
+        patch.object(kakera, "save", return_value=(True, "saved")) as save,
+        patch.object(kakera.time, "sleep", side_effect=change_then_stop),
+    ):
+        assert watch_inbox(watched, None, vault / "Clippings", vault / "assets") == 0
+    assert save.call_count == 1
+
+    config.write_text(
+        json.dumps(
+            {
+                "obsidian": {
+                    "vault": str(vault),
+                    "notes": "Clippings",
+                    "attachments": "assets",
+                    "inbox": "Kakera/inbox.md",
+                },
+                "todoist": {"project_id": "project-123"},
+            }
+        )
+    )
+
+    class TodoistResponse:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_arguments):
+            return False
+
+        def read(self):
+            return self.body
+
+    requests = []
+
+    def fake_todoist_urlopen(request, **_arguments):
+        requests.append((request.method, request.full_url))
+        if request.method == "POST":
+            return TodoistResponse(b"null")
+        if "cursor=next" in request.full_url:
+            return TodoistResponse(
+                json.dumps(
+                    {
+                        "results": [
+                            {"id": "task-2", "content": "No URL here", "description": "[capture](https://redd.it/BAD)"}
+                        ],
+                        "next_cursor": None,
+                    }
+                ).encode()
+            )
+        return TodoistResponse(
+            json.dumps(
+                {
+                    "results": [
+                        {"id": "task-1", "content": "[capture](https://www.instagram.com/p/GOOD/)"}
+                    ],
+                    "next_cursor": "next",
+                }
+            ).encode()
+        )
+
+    with (
+        patch.object(kakera, "CONFIG", config),
+        patch.object(kakera, "urlopen", side_effect=fake_todoist_urlopen),
+        patch.dict(kakera.os.environ, {"TODOIST_API_TOKEN": "secret"}),
+        patch.object(kakera, "save", side_effect=((True, "saved"), (False, "failed"))) as save,
+    ):
+        assert process_todoist("orion", vault / "Clippings", vault / "assets") == 1
+    assert [call.args[0] for call in save.call_args_list] == [
+        "https://www.instagram.com/p/GOOD/",
+        "https://redd.it/BAD",
+    ]
+    assert [method for method, _url in requests] == ["GET", "POST", "GET"]
+    assert "project_id=project-123" in requests[0][1]
+    assert "cursor=next" in requests[2][1]
 
     config.write_text("[]")
     with patch.object(kakera, "CONFIG", config):

@@ -5,5 +5,8 @@
     "notes": "kakera",
     "attachments": "attachments",
     "inbox": "kakera/inbox.md"
+  },
+  "todoist": {
+    "project_id": "YOUR_TODOIST_PROJECT_ID"
   }
 }
