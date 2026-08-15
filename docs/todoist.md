@@ -29,8 +29,9 @@ Copy that project's `id` value.
 3. Open its details, enable **Show in Share Sheet**, and allow **URLs** and
    **Text** as input types. Text support covers apps that share a URL as text.
 4. Add **Get URLs from Input** and set its input to **Shortcut Input**.
-5. Add **Get Item from List** and select **First Item** from the URLs. Kakera
-   needs one URL per Todoist task.
+5. Add **Get Item from List** and select **First Item** from the URLs. Each
+   Shortcut run creates one Todoist task; compose multiple sources later by
+   placing their URLs in the task or its subtasks.
 6. Add a **URL** action containing:
 
    ```text
@@ -85,8 +86,19 @@ Or keep Kakera polling:
 ./kakera todoist --watch
 ```
 
-After a successful capture, Kakera completes the task. Failed captures and
-tasks without a URL remain open.
+Kakera completes the root task after a successful capture. A parent task and its nested subtasks are
+one composition: URLs in the parent are read first, followed by each child
+depth-first, with each task's content before its description. The first URL is
+the Primary Source; later URLs are written into Additional Source Markdown sections.
+If at least one image is saved, the root task is completed even when another
+source failed; the failure reason remains in the Source Note. If no source
+produces an image, the task stays open for retry.
+
+Native Todoist labels on the parent and nested subtasks become Capture Tags in
+the same depth-first order as their URLs. Use `--tag` to add tags to every
+capture in an invocation, including watch mode. Hashtags typed in task text
+are not parsed as labels. See the README's [shared Capture Tag rules][tags]
+for normalization, duplicate handling, and merge order.
 
 ## Troubleshooting
 
@@ -107,3 +119,4 @@ Shortcut and `TODOIST_API_TOKEN` on the Kakera machine.
 [shortcuts]: https://support.apple.com/en-au/guide/shortcuts/apd58d46713f/ios
 [tasks]: https://developer.todoist.com/api/v1/#tag/Tasks/operation/create_task_api_v1_tasks_post
 [token]: https://www.todoist.com/help/articles/find-your-api-token-Jpzx9IIlB
+[tags]: ../README.md#capture-tags

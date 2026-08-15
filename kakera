@@ -5,6 +5,7 @@ case "${1:-}" in
   inbox) shift; exec uv run "$script" --inbox "$@" ;;
   todoist) shift; exec uv run "$script" --todoist "$@" ;;
   instagram-cookies) shift; exec uv run "$script" --instagram-cookies "$@" ;;
+  twitter-cookies) shift; exec uv run "$script" --twitter-cookies "$@" ;;
   reddit-oauth) shift; exec uv run "$script" --reddit-oauth "$@" ;;
   *) exec uv run "$script" --obsidian "$@" ;;
 esac
