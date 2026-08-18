@@ -72,6 +72,7 @@ with TemporaryDirectory() as directory:
 assert capture_id("https://redd.it/1abcxyz?utm_source=share") == "reddit-1abcxyz"
 assert canonical_url("https://redd.it/1abcxyz/?utm_source=x&keep=yes#top") == "https://redd.it/1abcxyz?keep=yes"
 assert capture_id("http://xhslink.com/o/ABC").startswith("rednote-")
+assert capture_id("http://xhslink.com/m/1JXFZx4ards") == "rednote-1JXFZx4ards"
 assert capture_id("https://x.com/artist/status/123456789") == "twitter-123456789"
 assert capture_id("https://www.twitter.com/artist/status/123456789/?s=20") == "twitter-123456789"
 assert capture_id("https://mobile.x.com/i/web/status/123456789") == "twitter-123456789"

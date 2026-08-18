@@ -244,7 +244,7 @@ def capture_id(url: str) -> str:
             raise ValueError("Reddit URL must be an individual post")
     elif host in rednote_hosts:
         service = "rednote"
-        if host in {"xhslink.com", "www.xhslink.com"} and len(segments) >= 2 and segments[0] == "o":
+        if host in {"xhslink.com", "www.xhslink.com"} and len(segments) >= 2 and segments[0] in {"m", "o"}:
             post_id = segments[1]
         elif host.endswith("xiaohongshu.com"):
             for marker in ("explore", "item"):

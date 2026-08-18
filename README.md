@@ -512,6 +512,7 @@ The configured inbox is an ordinary Markdown note. Add unchecked URL tasks:
 - [ ] https://www.instagram.com/p/...
 - [ ] https://x.com/USER/status/...
 - [ ] https://redd.it/...
+- [ ] http://xhslink.com/m/...
 - [ ] http://xhslink.com/o/...
 ```
 
@@ -563,7 +564,7 @@ non-service/manual tags and adding current queue or CLI tags.
 | Instagram | `https://www.instagram.com/p/ID/`, `/reel/ID/`, `/tv/ID/` | Uses gallery-dl; login cookies may be required. |
 | Twitter/X | `https://x.com/USER/status/ID`, `https://x.com/i/web/status/ID`, `twitter.com/.../status/ID`, optional `/photo/N` or `/video/N` | Individual status only; images are saved and videos are ignored. |
 | Reddit | `https://redd.it/ID`, Reddit `/comments/ID/` or `/gallery/ID/` URLs | Uses gallery-dl; configure Reddit OAuth when required. |
-| RedNote | `http(s)://xhslink.com/o/ID`, public `xiaohongshu.com/explore/ID` or `/item/ID` | Reads public page data and images; no login-only posts. |
+| RedNote | `http(s)://xhslink.com/m/ID` or `/o/ID`, public `xiaohongshu.com/explore/ID` or `/item/ID` | Reads public page data and images; no login-only posts. |
 
 ## Output
 
