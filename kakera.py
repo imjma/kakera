@@ -21,7 +21,7 @@ import unicodedata
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 
@@ -45,6 +45,11 @@ INBOX_TASK = re.compile(r"^\s*-\s+\[ \]\s+(https?://\S+)")
 HTTP_URL = re.compile(r"https?://[^\s<>\[\]\"']+")
 TODOIST_API = "https://api.todoist.com/api/v1"
 SOURCE_SERVICES = {"instagram", "twitter", "reddit", "rednote"}
+TELEGRAM_API = "https://api.telegram.org"
+TELEGRAM_RECEIPT = "kakera"
+TELEGRAM_TAG = "share/telegram"
+TELEGRAM_MAX_IMAGES = 10
+TELEGRAM_MAX_BYTES = 10 * 1024 * 1024
 
 
 def tag_character_allowed(character: str) -> bool:
@@ -162,11 +167,22 @@ def merge_tags(*groups: list[str]) -> list[str]:
 
 
 def canonical_url(url: str) -> str:
+    url = normalize_instagram_post_url(url)
     parts = urlsplit(url)
     query = urlencode(
         [(key, value) for key, value in parse_qsl(parts.query) if key not in TRACKING_PARAMETERS]
     )
     return urlunsplit((parts.scheme, parts.netloc.lower(), parts.path.rstrip("/"), query, ""))
+
+
+def normalize_instagram_post_url(url: str) -> str:
+    parts = urlsplit(url)
+    if (parts.hostname or "").lower() not in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
+        return url
+    segments = [segment for segment in parts.path.split("/") if segment]
+    if len(segments) < 2 or segments[0] not in {"p", "reel", "tv"}:
+        return url
+    return urlunsplit((parts.scheme, parts.netloc, f"/{segments[0]}/{segments[1]}/", "", ""))
 
 
 def dedupe_urls(urls: list[str]) -> list[str]:
@@ -427,6 +443,12 @@ def configured_paths(*names: str) -> tuple[Path, ...]:
         raise ValueError(f"Obsidian vault does not exist: {vault}")
     if any(path.is_absolute() or ".." in path.parts for path in paths):
         raise ValueError("Obsidian paths must stay inside the vault")
+    try:
+        resolved_vault = vault.resolve()
+        if any(not (vault / path).resolve().is_relative_to(resolved_vault) for path in paths):
+            raise ValueError("Obsidian paths must stay inside the vault")
+    except OSError as error:
+        raise ValueError(f"cannot resolve Obsidian paths: {error}") from error
     return tuple(vault / path for path in paths)
 
 
@@ -452,6 +474,32 @@ def todoist_token() -> str:
     token = os.environ.get("TODOIST_API_TOKEN", "").strip()
     if not token:
         raise ValueError("TODOIST_API_TOKEN is not set")
+    return token
+
+
+def configured_telegram_chat_id() -> str:
+    telegram = read_config().get("telegram")
+    if not isinstance(telegram, dict):
+        raise ValueError(f"invalid {CONFIG.name}: telegram must be an object")
+    try:
+        return canonical_telegram_chat_id(telegram.get("chat_id"))
+    except ValueError as error:
+        raise ValueError(f"invalid {CONFIG.name}: telegram.chat_id must be numeric") from error
+
+
+def canonical_telegram_chat_id(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError("chat ID must be numeric")
+    text = str(value).strip()
+    if not re.fullmatch(r"-?\d+", text):
+        raise ValueError("chat ID must be numeric")
+    return str(int(text))
+
+
+def telegram_token() -> str:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        raise ValueError("TELEGRAM_BOT_TOKEN is not set")
     return token
 
 
@@ -1057,6 +1105,9 @@ def write_note(
     properties.append("tags:")
     properties.extend(f"  - {json.dumps(tag, ensure_ascii=False)}"
                      for tag in merge_tags([service], tags or []))
+    kakera = _existing_kakera_value(note)
+    if kakera is not None:
+        properties.append(f"{TELEGRAM_RECEIPT}: {json.dumps(kakera, separators=(',', ':'))}")
     properties.append("---")
 
     links = "\n".join(
@@ -1166,6 +1217,9 @@ def write_composed_note(note: Path, sources: list[dict], tags: list[str]) -> Non
             properties.append(f"published: {json.dumps(str(published), ensure_ascii=False)}")
     properties.append("tags:")
     properties.extend(f"  - {json.dumps(tag, ensure_ascii=False)}" for tag in tags)
+    kakera = _existing_kakera_value(note)
+    if kakera is not None:
+        properties.append(f"{TELEGRAM_RECEIPT}: {json.dumps(kakera, separators=(',', ':'))}")
     properties.append("---")
 
     body = [_source_description(metadata, service)]
@@ -1197,6 +1251,578 @@ def write_composed_note(note: Path, sources: list[dict], tags: list[str]) -> Non
     write_atomic_note(note, content)
 
 
+def _telegram_frontmatter(text: str) -> tuple[dict[str, object], dict[str, str]]:
+    """Read simple top-level JSON frontmatter properties."""
+    lines = text.splitlines()
+    if not lines or lines[0].rstrip("\r") != "---":
+        return {}, {}
+    closing = next((i for i, line in enumerate(lines[1:], 1) if line.rstrip("\r") == "---"), None)
+    if closing is None:
+        return {}, {}
+    values, raw = {}, {}
+    for line in lines[1:closing]:
+        key, separator, value = line.partition(":")
+        if not separator or key != key.strip() or not key.strip():
+            continue
+        key = key.strip()
+        raw[key] = value.strip()
+        if key == TELEGRAM_RECEIPT:
+            continue
+        try:
+            values[key] = json.loads(value.strip())
+        except json.JSONDecodeError:
+            values[key] = value.strip().strip("\"'")
+    return values, raw
+
+
+def _strict_json(value: str) -> object:
+    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
+        result = {}
+        for key, item in items:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = item
+        return result
+    def reject_constant(constant: str) -> object:
+        raise ValueError(f"unsupported JSON constant: {constant}")
+    try:
+        return json.loads(value, object_pairs_hook=pairs, parse_constant=reject_constant)
+    except (TypeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError("invalid kakera receipt JSON") from error
+
+
+def _kakera_property(text: str) -> tuple[object | None, int | None, int | None]:
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\r\n") != "---":
+        return None, None, None
+    closing = next((i for i, line in enumerate(lines[1:], 1)
+                    if line.rstrip("\r\n") == "---"), None)
+    if closing is None:
+        return None, None, None
+    found = []
+    for index, line in enumerate(lines[1:closing], 1):
+        match = re.match(r"^kakera[ \t]*:", line)
+        if match:
+            found.append((index, line[match.end():].strip()))
+    if len(found) > 1:
+        raise ValueError("invalid kakera receipt: duplicate property")
+    if not found:
+        return None, None, closing
+    index, raw = found[0]
+    return _strict_json(raw), index, closing
+
+
+def _validated_kakera(text: str) -> tuple[dict[str, object], int | None, int | None]:
+    parsed, index, closing = _kakera_property(text)
+    if parsed is None and index is None:
+        return {}, index, closing
+    if not isinstance(parsed, dict):
+        raise ValueError("invalid kakera receipt: kakera must be an object")
+    shared = parsed.get("shared")
+    if "shared" in parsed and not isinstance(shared, dict):
+        raise ValueError("invalid kakera receipt: shared must be an object")
+    if isinstance(shared, dict) and "telegram" in shared:
+        telegram = shared["telegram"]
+        if not isinstance(telegram, dict):
+            raise ValueError("invalid kakera receipt: shared.telegram must be an object")
+        normalized = {}
+        for key, ids in telegram.items():
+            try:
+                canonical = canonical_telegram_chat_id(key)
+            except ValueError as error:
+                raise ValueError("invalid kakera receipt: chat ID") from error
+            if canonical in normalized:
+                raise ValueError("invalid kakera receipt: duplicate chat")
+            if (not isinstance(ids, list) or not ids or any(
+                    isinstance(item, bool) or not isinstance(item, int) or item <= 0
+                    for item in ids)):
+                raise ValueError("invalid kakera receipt: message IDs")
+            normalized[canonical] = ids
+        if normalized != telegram:
+            shared["telegram"] = normalized
+    return parsed, index, closing
+
+
+def _telegram_receipt(text: str, chat_id: str | None) -> tuple[dict[str, list[int]], int | None]:
+    parsed, _, _ = _validated_kakera(text)
+    shared = parsed.get("shared", {})
+    telegram = shared.get("telegram", {}) if isinstance(shared, dict) else {}
+    if not isinstance(telegram, dict):
+        return {}, None
+    if chat_id is None:
+        return dict(telegram), None
+    key = canonical_telegram_chat_id(chat_id)
+    return dict(telegram), telegram.get(key)
+
+
+def _existing_kakera_object(note: Path) -> dict[str, object]:
+    value = _existing_kakera_value(note)
+    return value if value is not None else {}
+
+
+def _existing_kakera_value(note: Path) -> dict[str, object] | None:
+    if not note.exists():
+        return None
+    parsed, index, _ = _validated_kakera(note.read_text())
+    if index is None:
+        return None
+    return parsed
+
+
+def _existing_telegram_receipt(note: Path) -> dict[str, list[int]]:
+    """Compatibility name for callers; reads only the nested schema."""
+    if not note.exists():
+        return {}
+    receipt, _ = _telegram_receipt(note.read_text(), None)
+    return receipt
+
+
+def _set_telegram_receipt(text: str, chat_id: str, message_ids: list[int]) -> str:
+    parsed, index, closing = _validated_kakera(text)
+    chat_id = canonical_telegram_chat_id(chat_id)
+    if any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in message_ids):
+        raise ValueError("invalid Telegram message IDs")
+    shared = parsed.setdefault("shared", {})
+    if not isinstance(shared, dict):
+        raise ValueError("invalid kakera receipt: shared must be an object")
+    telegram = shared.setdefault("telegram", {})
+    if not isinstance(telegram, dict):
+        raise ValueError("invalid kakera receipt: shared.telegram must be an object")
+    telegram[chat_id] = message_ids
+    value = f"kakera: {json.dumps(parsed, ensure_ascii=False, separators=(',', ':'))}"
+    lines = text.splitlines(keepends=True)
+    if index is not None and closing is not None:
+        ending = "\r\n" if lines[index].endswith("\r\n") else "\n" if lines[index].endswith("\n") else ""
+        lines[index] = value + ending
+        return "".join(lines)
+    if closing is not None:
+        ending = "\r\n" if lines[closing].endswith("\r\n") else "\n"
+        lines.insert(closing, value + ending)
+        return "".join(lines)
+    return f"---\n{value}\n---\n" + text
+
+
+def _write_telegram_receipt(note: Path, original: str, updated: str) -> None:
+    if note.read_text() != original:
+        raise OSError("note changed during Telegram delivery; receipt not written")
+    write_atomic_note(note, updated)
+
+
+def _telegram_image_url(url: str) -> bool:
+    path = urlsplit(url).path.lower()
+    return path.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".heic", ".tif", ".tiff"))
+
+
+def _telegram_image_index(vault: Path) -> dict[str, list[Path]]:
+    vault = vault.resolve()
+    index: dict[str, list[Path]] = {}
+    for path in vault.rglob("*"):
+        try:
+            resolved = path.resolve()
+            if not resolved.is_relative_to(vault) or not resolved.is_file() or not image_extension(resolved):
+                continue
+            bucket = index.setdefault(resolved.name, [])
+            if resolved not in bucket:
+                bucket.append(resolved)
+        except OSError:
+            continue
+    return index
+
+
+def _telegram_note_images(note: Path, vault: Path, image_index: dict[str, list[Path]] | None = None) -> list[Path]:
+    text = note.read_text()
+    embeds = list(re.finditer(
+        r"!\[\[[^\]]*\]\]|!\[[^\]]*\]\([^)]*\)", text
+    ))
+    vault = vault.resolve()
+    result, seen = [], set()
+    oversized = overflow = 0
+    for embed in embeds:
+        token = embed.group(0)
+        if token.startswith("![["):
+            target = token[3:-2].split("|", 1)[0].split("#", 1)[0].strip()
+            parsed = urlsplit(target)
+            if parsed.scheme or parsed.netloc or target.startswith("data:"):
+                continue
+            if "/" not in target and "\\" not in target:
+                candidates = (image_index or _telegram_image_index(vault)).get(Path(target).name, [])
+                if len(candidates) > 1:
+                    print(f"warning: ambiguous Obsidian image embed omitted: {target}", file=sys.stderr)
+                    continue
+            else:
+                candidates = [vault / target.lstrip("/")]
+        else:
+            match = re.match(r"!\[[^\]]*\]\((?:<([^>]+)>|([^ )]+))", token)
+            target = next((value for value in match.groups() if value is not None), "") if match else ""
+            parsed = urlsplit(target)
+            if parsed.scheme or parsed.netloc or target.startswith("data:"):
+                continue
+            candidates = [note.parent / unquote(parsed.path)]
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+                if not resolved.is_relative_to(vault) or not resolved.is_file() or resolved in seen:
+                    continue
+                if not image_extension(resolved):
+                    continue
+                seen.add(resolved)
+                if resolved.stat().st_size > TELEGRAM_MAX_BYTES:
+                    oversized += 1
+                    continue
+                if len(result) == TELEGRAM_MAX_IMAGES:
+                    overflow += 1
+                    continue
+                result.append(resolved)
+                break
+            except OSError:
+                continue
+    if oversized:
+        print(f"warning: skipped {oversized} Telegram image(s) over 10 MB", file=sys.stderr)
+    if overflow:
+        print(f"warning: skipped {overflow} eligible Telegram image(s) after the first 10", file=sys.stderr)
+    return result
+
+
+def _telegram_note_caption(note: Path, text: str, selected_url: str | None = None) -> str:
+    values, _ = _telegram_frontmatter(text)
+    url = selected_url
+    if not url:
+        for key in ("source", "instagram", "twitter", "reddit", "xhslink", "url"):
+            value = values.get(key)
+            if isinstance(value, str) and re.match(r"^https?://", value, re.I):
+                url = value
+                break
+    if not url:
+        body = text.split("---", 2)[-1] if text.startswith("---") else text
+        body = re.sub(r"!\[[^\]]*\]\([^)]*\)|!\[\[[^\]]*\]\]", "", body)
+        url = next((match.group(0).rstrip(".,!?;:)]}") for match in HTTP_URL.finditer(body)
+                    if not _telegram_image_url(match.group(0))), None)
+    return _telegram_caption_text(
+        note.stem, normalize_instagram_post_url(url) if url else url, note.name
+    )
+
+
+def _telegram_caption_text(stem: str, url: str | None, label: str = "note") -> str:
+    stem = stem.replace("\r", " ").replace("\n", " ")
+    if url:
+        if len(stem) + 1 + len(url) <= 1024:
+            return f"{stem}\n{url}"
+        print(f"warning: Telegram caption URL omitted because it does not fit: {label}", file=sys.stderr)
+    return stem[:1024]
+
+
+def _telegram_filter_images(paths: list[Path]) -> list[Path]:
+    result, seen = [], set()
+    oversized = overflow = 0
+    for path in paths:
+        try:
+            path = path.resolve()
+            if not path.is_file() or path in seen or not image_extension(path):
+                continue
+            seen.add(path)
+            if path.stat().st_size > TELEGRAM_MAX_BYTES:
+                oversized += 1
+                continue
+            if len(result) >= TELEGRAM_MAX_IMAGES:
+                overflow += 1
+                continue
+            result.append(path)
+        except OSError:
+            continue
+    if oversized:
+        print(f"warning: skipped {oversized} Telegram image(s) over 10 MB", file=sys.stderr)
+    if overflow:
+        print(f"warning: skipped {overflow} eligible Telegram image(s) after the first 10", file=sys.stderr)
+    return result
+
+
+def _telegram_multipart(method: str, chat_id: str, caption: str, images: list[Path]) -> tuple[bytes, str]:
+    boundary = f"kakera{hashlib.sha256(os.urandom(16)).hexdigest()}"
+    chunks = []
+    def field(name: str, value: str):
+        chunks.extend((f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode(),))
+    field("chat_id", chat_id)
+    if method == "sendPhoto":
+        field("caption", caption)
+        path = images[0]
+        data = path.read_bytes()
+        chunks.extend((f"--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"photo{image_extension(path) or '.bin'}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode(), data, b"\r\n"))
+    else:
+        media = [{"type": "photo", "media": f"attach://file{i}", **({"caption": caption} if i == 0 else {})}
+                 for i in range(len(images))]
+        field("media", json.dumps(media, separators=(",", ":")))
+        for i, path in enumerate(images):
+            chunks.extend((f"--{boundary}\r\nContent-Disposition: form-data; name=\"file{i}\"; filename=\"file{i}{image_extension(path) or '.bin'}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode(), path.read_bytes(), b"\r\n"))
+    chunks.append(f"--{boundary}--\r\n".encode())
+    return b"".join(chunks), boundary
+
+
+def telegram_send(chat_id: str, caption: str, images: list[Path], token: str | None = None) -> list[int]:
+    if not 1 <= len(images) <= TELEGRAM_MAX_IMAGES:
+        raise ValueError("Telegram delivery requires 1 to 10 images")
+    method = "sendPhoto" if len(images) == 1 else "sendMediaGroup"
+    body, boundary = _telegram_multipart(method, chat_id, caption, images)
+    token = token or telegram_token()
+    request = Request(
+        f"{TELEGRAM_API}/bot{token}/{method}", data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}, method="POST",
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            if getattr(response, "status", 200) >= 400:
+                raise OSError("Telegram HTTP error")
+            payload = json.loads(response.read() or b"{}")
+    except (OSError, json.JSONDecodeError, TypeError) as error:
+        raise ValueError("Telegram request failed") from error
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        raise ValueError("Telegram rejected the delivery")
+    result = payload.get("result")
+    messages = result if method == "sendMediaGroup" else [result]
+    if (not isinstance(messages, list) or len(messages) != len(images)
+            or any(not isinstance(item, dict)
+                   or isinstance(item.get("message_id"), bool)
+                   or not isinstance(item.get("message_id"), int)
+                   or item["message_id"] <= 0 for item in messages)):
+        raise ValueError("Telegram returned an invalid delivery response")
+    return [item["message_id"] for item in messages]
+
+
+def publish_telegram_note(note: Path, vault: Path, *, selected_url: str | None = None,
+                          manual: bool = False, relative_root: Path | None = None,
+                          image_index: dict[str, list[Path]] | None = None) -> tuple[bool, str]:
+    chat_id = configured_telegram_chat_id()
+    with capture_lock(note.parent, "telegram", note.name):
+        text = note.read_text()
+        receipt, current = _telegram_receipt(text, chat_id)
+        if current:
+            if not manual:
+                return True, f"Telegram already sent to {chat_id}"
+            images = _telegram_note_images(note, vault, image_index)
+            if not images:
+                raise ValueError(f"{note.name}: no eligible local images")
+            token = telegram_token()
+            label = note.relative_to(relative_root) if relative_root else note.relative_to(note.parent)
+            prompt = f"{label} was already sent to Telegram chat {chat_id}. Send again? [y/N] "
+            if not sys.stdin.isatty():
+                raise ValueError("cannot confirm Telegram resend without an interactive terminal")
+            print(prompt, file=sys.stderr, end="", flush=True)
+            answer = sys.stdin.readline()
+            if not answer:
+                raise ValueError("cannot confirm Telegram resend: end of input")
+            if answer.strip().casefold() not in {"y", "yes"}:
+                return True, "resend declined"
+        else:
+            images = _telegram_note_images(note, vault, image_index)
+            if not images:
+                raise ValueError(f"{note.name}: no eligible local images")
+            token = telegram_token()
+        caption = _telegram_note_caption(note, text, selected_url)
+        # ponytail: network stays under the note lock; split decision/send/update only if throughput matters.
+        try:
+            message_ids = telegram_send(chat_id, caption, images, token)
+        except ValueError:
+            return False, "Telegram delivery uncertain; check the configured chat before retrying"
+        # Re-read after Telegram acknowledges so concurrent Obsidian edits survive receipt writeback.
+        try:
+            latest = note.read_text()
+            updated = _set_telegram_receipt(latest, chat_id, message_ids)
+            _write_telegram_receipt(note, latest, updated)
+        except (OSError, ValueError) as error:
+            return False, f"Telegram sent but receipt update failed: {error}"
+    return True, f"Telegram sent {len(message_ids)} image(s) to {chat_id}"
+
+
+def _telegram_note_files(notes: Path) -> list[Path]:
+    notes = notes.resolve()
+    try:
+        return [path.resolve() for path in notes.rglob("*.md")
+                if path.resolve().is_relative_to(notes) and path.resolve().is_file()]
+    except OSError as error:
+        raise ValueError(f"cannot scan Obsidian notes: {error}") from error
+
+
+def _telegram_note_candidates(selector: str, notes: Path, vault: Path,
+                              files: list[Path] | None = None) -> tuple[list[Path], str | None]:
+    notes = notes.resolve()
+    vault = vault.resolve()
+    # ponytail: O(n) recursive scan per command; command mode supplies one scan-built file list.
+    files = files if files is not None else _telegram_note_files(notes)
+    selector = selector.strip()
+    if re.match(r"^https?://", selector, re.I):
+        matches = []
+        for path in files:
+            values, _ = _telegram_frontmatter(path.read_text())
+            for key, value in values.items():
+                if key in {"source", "instagram", "twitter", "reddit", "xhslink", "url"} and isinstance(value, str) and re.match(r"^https?://", value, re.I) and canonical_url(value) == canonical_url(selector):
+                    matches.append(path)
+                    break
+        return matches, normalize_instagram_post_url(selector) if matches else None
+    wikilink = selector.startswith("[[") and selector.endswith("]]" )
+    if wikilink:
+        selector = selector[2:-2].split("|", 1)[0].strip()
+    path_matches = []
+    raw_path = Path(selector)
+    wikilink_path = wikilink and ("/" in selector or "\\" in selector)
+    exact_path_selector = (not wikilink and raw_path.suffix.casefold() == ".md") or wikilink_path
+    qualified_path = raw_path.is_absolute() or len(raw_path.parts) > 1
+    if exact_path_selector:
+        candidate = raw_path if raw_path.is_absolute() else notes / raw_path
+        if wikilink and candidate.suffix.casefold() != ".md":
+            candidate = candidate.with_suffix(".md")
+        try:
+            candidate = candidate.resolve()
+            if candidate.is_file() and candidate.suffix.casefold() == ".md" and candidate.is_relative_to(notes):
+                path_matches = [candidate]
+        except OSError:
+            pass
+    if path_matches or qualified_path:
+        return path_matches, None
+    stem = Path(selector).stem if selector.casefold().endswith(".md") else selector
+    matches = [path for path in files if path.name == selector or path.stem == stem]
+    return matches, None
+
+
+def telegram_command(selectors: list[str]) -> int:
+    notes, _ = configured_folders()
+    notes = notes.resolve()
+    config = read_config().get("obsidian", {})
+    vault = Path(config["vault"]).expanduser().resolve()
+    if not notes.is_relative_to(vault):
+        raise ValueError("configured Obsidian notes folder must stay inside the vault")
+    files = _telegram_note_files(notes)
+    image_index = _telegram_image_index(vault)
+    failed = False
+    for selector in selectors:
+        try:
+            matches, selected_url = _telegram_note_candidates(selector, notes, vault, files)
+            if not matches:
+                raise ValueError(f"no note matched {selector!r}")
+            if len(matches) > 1:
+                relative = ", ".join(str(path.relative_to(notes)) for path in matches)
+                raise ValueError(f"ambiguous note {selector!r}: {relative}")
+            note = matches[0]
+            success, message = publish_telegram_note(
+                note, vault, selected_url=selected_url, manual=True, relative_root=notes,
+                image_index=image_index
+            )
+            print(f"{'ok' if success else 'error'}: {note.relative_to(notes)}: {message}")
+            failed |= not success
+        except KeyboardInterrupt:
+            print("error: Telegram resend cancelled", file=sys.stderr)
+            return 130
+        except EOFError:
+            print("error: Telegram resend cancelled", file=sys.stderr)
+            failed = True
+        except (OSError, ValueError) as error:
+            print(f"error: {selector}: {error}", file=sys.stderr)
+            failed = True
+    return int(failed)
+
+
+def telegram_note_only_command(selectors: list[str]) -> int:
+    """Publish selected notes without consulting or changing Telegram receipts."""
+    chat_id = configured_telegram_chat_id()
+    token = telegram_token()
+    notes, _ = configured_folders()
+    notes = notes.resolve()
+    config = read_config().get("obsidian", {})
+    vault = Path(config["vault"]).expanduser().resolve()
+    if not notes.is_relative_to(vault):
+        raise ValueError("configured Obsidian notes folder must stay inside the vault")
+    files = _telegram_note_files(notes)
+    image_index = _telegram_image_index(vault)
+    failed = False
+    for selector in selectors:
+        try:
+            matches, selected_url = _telegram_note_candidates(selector, notes, vault, files)
+            if not matches:
+                raise ValueError(f"no note matched {selector!r}")
+            if len(matches) > 1:
+                relative = ", ".join(str(path.relative_to(notes)) for path in matches)
+                raise ValueError(f"ambiguous note {selector!r}: {relative}")
+            note = matches[0]
+            text = note.read_text()
+            images = _telegram_note_images(note, vault, image_index)
+            if not images:
+                raise ValueError(f"{note.name}: no eligible local images")
+            try:
+                message_ids = telegram_send(
+                    chat_id, _telegram_note_caption(note, text, selected_url), images, token
+                )
+            except ValueError as error:
+                raise ValueError("Telegram delivery uncertain; check the configured chat before retrying") from error
+            message = f"Telegram sent {len(message_ids)} image(s) to {chat_id}"
+            print(f"ok: {note.relative_to(notes)}: {message}")
+        except KeyboardInterrupt:
+            print("error: Telegram send cancelled", file=sys.stderr)
+            return 130
+        except (OSError, ValueError) as error:
+            print(f"error: {selector}: {error}", file=sys.stderr)
+            failed = True
+    return int(failed)
+
+
+def telegram_only_url(url: str, browser: str | None, account: str | None = None,
+                      twitter_account: str | None = None) -> tuple[bool, str]:
+    """Fetch one URL to a temporary directory and publish its images without saving."""
+    chat_id = configured_telegram_chat_id()
+    token = telegram_token()
+    try:
+        name = capture_id(url)
+    except ValueError as error:
+        return False, f"Telegram not sent: {error}"
+    with tempfile.TemporaryDirectory(prefix="kakera-telegram-") as directory:
+        source, error = fetch_source(url, browser, account, twitter_account,
+                                     Path(directory), name)
+        source_error = error or (source.get("error") if isinstance(source, dict) else None)
+        if source_error or not source:
+            return False, f"Telegram not sent: {source_error or 'source fetch failed'}"
+        temporary_root = Path(directory).resolve()
+        candidates = []
+        for path, _ in source.get("valid", []):
+            try:
+                if path.resolve().is_relative_to(temporary_root):
+                    candidates.append(path)
+            except OSError:
+                pass
+        images = _telegram_filter_images(candidates)
+        if not images:
+            return False, "Telegram not sent: no eligible local images"
+        metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
+        stem = note_filename(metadata, source.get("service", "unknown"))
+        caption = _telegram_caption_text(
+            stem, normalize_instagram_post_url(source.get("url", url)), url
+        )
+        try:
+            message_ids = telegram_send(chat_id, caption, images, token)
+        except ValueError as send_error:
+            return False, "Telegram delivery uncertain; check the configured chat before retrying"
+    return True, f"Telegram sent {len(message_ids)} image(s) to {chat_id}; nothing saved"
+
+
+def telegram_requested(tags: list[str] | None) -> bool:
+    return any(isinstance(tag, str) and tag.casefold() == TELEGRAM_TAG for tag in tags or [])
+
+
+def capture_telegram_vault(notes: Path) -> Path:
+    try:
+        configured = read_config().get("obsidian", {}).get("vault")
+        if configured:
+            vault = Path(configured).expanduser().resolve()
+            if notes.resolve().is_relative_to(vault):
+                return vault
+    except (AttributeError, TypeError):
+        pass
+    return notes.parent.resolve()
+
+
+def publish_capture_telegram(note: Path, notes: Path) -> tuple[bool, str]:
+    try:
+        return publish_telegram_note(note, capture_telegram_vault(notes))
+    except (OSError, ValueError) as error:
+        return False, str(error)
+
+
 def save(
     url: str,
     browser: str | None,
@@ -1226,7 +1852,12 @@ def save(
                 note = note_path(notes, source["name"], source["metadata"], url)
                 write_note(note, url, stored, source["metadata"], source["service"],
                            merge_tags(note_tags(note), tags or []))
-        except OSError as error:
+            if telegram_requested(tags):
+                delivered, delivery_message = publish_capture_telegram(note, notes)
+                if not delivered:
+                    return False, f"capture saved; Telegram failed: {delivery_message}"
+                return True, f"saved {len(stored)} image(s); {delivery_message}"
+        except (OSError, ValueError) as error:
             return False, f"cannot save capture: {error}"
         return True, f"saved {len(stored)} image(s)"
 
@@ -1244,6 +1875,7 @@ def fetch_source(
         name = name or capture_id(url)
     except ValueError as error:
         return None, str(error)
+    normalized_url = normalize_instagram_post_url(url)
     metadata: dict = {}
     result = None
     if name.startswith("rednote-"):
@@ -1280,7 +1912,7 @@ def fetch_source(
                                 "-o", f"extractor.reddit.user-agent={reddit[1]}"))
         if name.startswith("twitter-"):
             command.extend(("-o", "extractor.twitter.videos=false"))
-        command.append(url)
+        command.append(normalized_url)
         result = subprocess.run(command, capture_output=True, text=True)
     if result and result.returncode:
         error = next((line for line in reversed(result.stderr.splitlines()) if line.strip()), "download failed")
@@ -1341,8 +1973,9 @@ def fetch_source(
             except (OSError, json.JSONDecodeError):
                 pass
     service = name.split("-", 1)[0]
-    metadata = _normalise_source_metadata(name, service, metadata, url)
-    return {"name": name, "service": service, "url": url, "metadata": metadata, "valid": valid}, None
+    metadata = _normalise_source_metadata(name, service, metadata, normalized_url)
+    return {"name": name, "service": service, "url": normalized_url,
+            "metadata": metadata, "valid": valid}, None
 
 
 def store_source_images(source: dict, notes: Path, attachment_root: Path) -> list[Path]:
@@ -1549,11 +2182,18 @@ def save_composed(
             with capture_lock(notes, primary["service"], primary["name"]):
                 note = composed_note_path(notes, primary)
                 write_composed_note(note, sources, merge_tags(service_tags, note_tags(note), tags or []))
-        except OSError as error:
+            if telegram_requested(tags):
+                delivered, delivery_message = publish_capture_telegram(note, notes)
+                if not delivered:
+                    return False, f"capture saved; Telegram failed: {delivery_message}"
+                delivery_suffix = f"; {delivery_message}"
+            else:
+                delivery_suffix = ""
+        except (OSError, ValueError) as error:
             return False, f"cannot save composition: {error}"
         failures = sum(1 for source in sources if source.get("error"))
         suffix = f"; {failures} source(s) failed" if failures else ""
-        return True, f"saved {sum(len(source['images']) for source in successful)} image(s){suffix}"
+        return True, f"saved {sum(len(source['images']) for source in successful)} image(s){suffix}{delivery_suffix if telegram_requested(tags) else ''}"
 
 
 def process_inbox(
@@ -1806,10 +2446,12 @@ def watch_inbox(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Save Instagram, Twitter/X, Reddit, and RedNote images as Markdown captures.",
-        epilog=("Shortcuts: kakera URL, kakera local URL, kakera inbox, "
-                "kakera todoist, kakera instagram-cookies, kakera twitter-cookies, "
-                "kakera reddit-oauth"),
+        description=("Save Instagram, Twitter/X, Reddit, and RedNote images as local Captures "
+                     "or publish Telegram Deliveries."),
+        epilog=("Forms: kakera --telegram URL [URL ...]; kakera telegram SELECTOR [SELECTOR ...]; "
+                "kakera telegram-only SELECTOR [SELECTOR ...]; "
+                "kakera --telegram-only URL [URL ...]. "
+                "Use --tag share/telegram for the current Capture request."),
     )
     parser.add_argument("--version", action="version", version=f"Kakera {VERSION}")
     parser.add_argument("--browser", help="browser cookies to pass to gallery-dl, e.g. safari")
@@ -1827,11 +2469,25 @@ def main() -> int:
     parser.add_argument("--todoist", action="store_true", help="process open Todoist tasks")
     parser.add_argument("--compose", action="store_true",
                         help="compose multiple URLs into one Source Note")
+    parser.add_argument("--telegram", action="store_true",
+                        help="save the Capture first, then publish this request to Telegram")
+    parser.add_argument("--telegram-note", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--telegram-note-only", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--telegram-only", action="store_true",
+                        help="fetch and publish URLs with no durable Kakera output")
+    parser.add_argument("--local", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--tag", action="append", default=[], metavar="TAG",
                         help="add a Capture tag; may be repeated")
     parser.add_argument("--reddit-oauth", nargs="?", const="", metavar="USERNAME")
-    parser.add_argument("urls", nargs="*")
+    parser.add_argument("urls", nargs="*", metavar="INPUT",
+                        help="URL, or note selector for a note publishing command")
     arguments = parser.parse_args()
+
+    pseudo_names = {"local", "inbox", "todoist", "telegram", "telegram-only",
+                    "instagram-cookies", "twitter-cookies", "reddit-oauth"}
+    note_mode = arguments.telegram_note or arguments.telegram_note_only
+    if not note_mode and any(url in pseudo_names for url in arguments.urls):
+        parser.error("pseudo-subcommands must be the first command word")
 
     try:
         cli_tags = normalize_tags(arguments.tag)
@@ -1841,6 +2497,55 @@ def main() -> int:
                      arguments.twitter_cookies is not None or
                      arguments.reddit_oauth is not None):
         parser.error("--tag requires a capture command")
+    auth_options = (
+        arguments.instagram_cookies is not None, arguments.twitter_cookies is not None,
+        arguments.reddit_oauth is not None,
+    )
+    if arguments.telegram and any(auth_options):
+        parser.error("--telegram cannot be combined with cookie export or Reddit OAuth")
+    if (arguments.telegram_only and (arguments.telegram or arguments.compose or arguments.local or
+                                      arguments.obsidian or arguments.inbox or arguments.todoist or
+                                      arguments.watch or arguments.tag or any(auth_options))):
+        parser.error("--telegram-only accepts URLs and source account options only")
+    if arguments.telegram_note or arguments.telegram_note_only:
+        if not arguments.urls:
+            parser.error("telegram note publishing requires at least one note selector")
+        if (arguments.browser or arguments.account or arguments.twitter_account or
+                any(auth_options) or arguments.obsidian or arguments.inbox or arguments.watch or
+                arguments.todoist or arguments.compose or arguments.telegram or arguments.telegram_only or
+                arguments.local or arguments.tag):
+            parser.error("telegram note publishing accepts selectors only")
+        try:
+            return (telegram_note_only_command(arguments.urls) if arguments.telegram_note_only
+                    else telegram_command(arguments.urls))
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+    if arguments.telegram_only and not arguments.urls:
+        parser.error("--telegram-only requires at least one URL")
+    if arguments.telegram_only:
+        try:
+            configured_telegram_chat_id()
+            telegram_token()
+            browser = arguments.browser or configured_browser()
+            account = account_name(arguments.account) if arguments.account else (
+                None if arguments.browser else configured_instagram_account()
+            )
+            twitter_account = account_name(arguments.twitter_account) if arguments.twitter_account else (
+                None if arguments.browser else configured_twitter_account()
+            )
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+        failed = False
+        for url in arguments.urls:
+            try:
+                success, message = telegram_only_url(url, browser, account, twitter_account)
+            except (OSError, ValueError) as error:
+                success, message = False, f"Telegram not sent: {error}"
+            print(f"{'ok' if success else 'error'}: {url}: {message}")
+            failed |= not success
+        return int(failed)
+    if arguments.telegram:
+        cli_tags = merge_tags(cli_tags, [TELEGRAM_TAG])
 
     if arguments.instagram_cookies is not None:
         if arguments.urls:
@@ -1881,7 +2586,7 @@ def main() -> int:
         twitter_account = explicit_twitter_account or (
             None if arguments.browser else configured_twitter_account()
         )
-        notes, attachments = configured_folders() if arguments.obsidian or arguments.inbox or arguments.todoist else (
+        notes, attachments = configured_folders() if not arguments.local and (arguments.obsidian or arguments.inbox or arguments.todoist or arguments.telegram) else (
             ROOT / "downloads",
             ROOT / "attachments",
         )

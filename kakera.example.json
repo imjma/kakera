@@ -8,5 +8,8 @@
   },
   "todoist": {
     "project_id": "YOUR_TODOIST_PROJECT_ID"
+  },
+  "telegram": {
+    "chat_id": "-1001234567890"
   }
 }

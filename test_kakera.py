@@ -1,10 +1,12 @@
 import errno
 import hashlib
+import io
 import json
 import multiprocessing as mp
 import os
 import re
-from contextlib import contextmanager
+import subprocess
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from threading import Barrier, Event, Lock, Thread
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -49,6 +51,24 @@ def _process_store_worker(incoming, attachment_root, extension, queue, name="ins
 
 
 assert capture_id("https://www.instagram.com/p/ABC_123/?igsh=tracking") == "instagram-ABC_123"
+for shape in ("p", "reel", "tv"):
+    indexed = f"https://www.instagram.com/{shape}/DbqJEsLna8A/?foo=bar&igsh=tracking#comments"
+    base = f"https://www.instagram.com/{shape}/DbqJEsLna8A/"
+    assert kakera.normalize_instagram_post_url(indexed) == base
+    assert canonical_url(indexed) == base.rstrip("/")
+assert canonical_url("https://x.com/a/status/1?keep=yes#fragment") == "https://x.com/a/status/1?keep=yes"
+assert kakera.dedupe_urls([
+    "https://www.instagram.com/p/DbqJEsLna8A/?foo=bar",
+    "https://www.instagram.com/p/DbqJEsLna8A/",
+]) == ["https://www.instagram.com/p/DbqJEsLna8A/?foo=bar"]
+with TemporaryDirectory() as directory:
+    normalized_note_root = Path(directory)
+    normalized_note = normalized_note_root / "existing.md"
+    normalized_note.write_text('---\ninstagram: "https://www.instagram.com/p/DbqJEsLna8A/"\n---\n')
+    assert kakera.note_path(
+        normalized_note_root, "instagram-DbqJEsLna8A", {},
+        "https://www.instagram.com/p/DbqJEsLna8A/?foo=bar#comments",
+    ) == normalized_note
 assert capture_id("https://redd.it/1abcxyz?utm_source=share") == "reddit-1abcxyz"
 assert canonical_url("https://redd.it/1abcxyz/?utm_source=x&keep=yes#top") == "https://redd.it/1abcxyz?keep=yes"
 assert capture_id("http://xhslink.com/o/ABC").startswith("rednote-")
@@ -1017,6 +1037,15 @@ with TemporaryDirectory() as directory:
     with patch.object(kakera, "save", return_value=(True, "saved")) as save:
         assert kakera.save_composed(duplicate, None, root / "notes", root / "attachments")[0]
         assert save.call_args.args[0] == duplicate[0]
+    instagram_duplicate = [
+        "https://www.instagram.com/p/DbqJEsLna8A/?foo=bar",
+        "https://www.instagram.com/p/DbqJEsLna8A/",
+    ]
+    with patch.object(kakera, "save", return_value=(True, "saved")) as save:
+        assert kakera.save_composed(
+            instagram_duplicate, None, root / "notes", root / "attachments"
+        )[0]
+        assert save.call_args.args[0] == instagram_duplicate[0]
 
     existing = root / "notes" / "existing.md"
     existing.parent.mkdir()
@@ -1066,6 +1095,29 @@ with TemporaryDirectory() as directory:
                                                         key=lambda path: int(path.stem.rsplit("-", 1)[1]))]
     assert ordered == [1, 2, 10, 11]
     assert 'title: "caption 1 - Instagram"' in (root / "notes" / "caption 1 - Instagram.md").read_text()
+
+    normalized_root = root / "normalized-fetch"
+    normalized_url = "https://www.instagram.com/p/DbqJEsLna8A/"
+    indexed_url = normalized_url + "?foo=bar&igsh=tracking#comments"
+    def normalized_download(command, **_arguments):
+        assert command[-1] == normalized_url
+        assert not any("range" in str(item).casefold() for item in command)
+        directory = Path(command[command.index("--directory") + 1])
+        paths = []
+        for index in range(3):
+            image = directory / f"carousel-{index}.jpg"
+            image.write_bytes(b"\xff\xd8\xff\xe0" + bytes([index]))
+            paths.append(image)
+        paths[0].with_suffix(".jpg.json").write_text(json.dumps({"title": "Carousel"}))
+        return CompletedProcess(command, 0, "\n".join(str(path) for path in paths), "")
+    with patch.object(kakera.subprocess, "run", side_effect=normalized_download):
+        normalized_source, normalized_error = kakera.fetch_source(
+            indexed_url, None, None, None, normalized_root, "instagram-DbqJEsLna8A"
+        )
+    assert normalized_error is None
+    assert normalized_source["url"] == normalized_url
+    assert normalized_source["metadata"]["post_url"] == normalized_url
+    assert len(normalized_source["valid"]) == 3
 
     number_root = root / "number-boundary"
     number_dir = number_root / "attachments" / "instagram"
@@ -1837,3 +1889,612 @@ with TemporaryDirectory() as directory:
     ):
         assert process_todoist(None, root / "n", root / "a") == 1
     assert not [url for method, url in hierarchy_calls if method == "POST"]
+
+
+with TemporaryDirectory() as directory:
+    root = Path(directory)
+    vault, notes = root / "vault", root / "vault" / "Kakera"
+    notes.mkdir(parents=True)
+    image = vault / "photo.jpg"
+    image.parent.mkdir(parents=True, exist_ok=True)
+    image.write_bytes(b"\xff\xd8\xffimage")
+    note = notes / "Folder" / "Example.md"
+    note.parent.mkdir()
+    note.write_text(
+        '---\nsource: "https://example.test/source"\n---\n'
+        '![[photo.jpg]]\n'
+    )
+    matches, selected = kakera._telegram_note_candidates(
+        "https://example.test/source", notes, vault
+    )
+    assert matches == [note.resolve()] and selected == "https://example.test/source"
+    assert kakera._telegram_note_candidates("[[Folder/Example]]", notes, vault)[0] == [note.resolve()]
+    assert kakera._telegram_note_images(note, vault) == [image.resolve()]
+    assert kakera._telegram_note_caption(Path("a" * 1100 + ".md"), "x") == "a" * 1024
+    assert kakera._set_telegram_receipt(
+        "---\nsource: x\n---\nbody\n", "-1", [4, 5]
+    ) == "---\nsource: x\nkakera: {\"shared\":{\"telegram\":{\"-1\":[4,5]}}}\n---\nbody\n"
+
+    # Telegram's shared seams: multipart safety, ambiguity, concurrent writeback,
+    # and the configured-vault boundary.
+    odd = vault / "odd\n\"name.jpg"
+    odd.write_bytes(b"\xff\xd8\xffodd")
+    body, boundary = kakera._telegram_multipart("sendPhoto", "-1", "caption", [odd])
+    assert b'filename="photo.jpg"' in body and b'odd\n"name.jpg' not in body
+    duplicate = vault / "other" / "photo.jpg"
+    duplicate.parent.mkdir()
+    duplicate.write_bytes(b"\xff\xd8\xffduplicate")
+    bare = notes / "bare.md"
+    bare.write_text("![[photo.jpg]]\n")
+    assert kakera._telegram_note_images(bare, vault, kakera._telegram_image_index(vault)) == []
+    limited = []
+    for index in range(13):
+        path = vault / f"limit-{index}.jpg"
+        path.write_bytes(b"\xff\xd8\xfflimit")
+        if index == 0:
+            path.open("ab").truncate(kakera.TELEGRAM_MAX_BYTES + 1)
+        limited.append(path)
+    limited_note = notes / "limited.md"
+    limited_note.write_text("\n".join(f"![[{path.name}]]" for path in limited) + "\n")
+    warning = io.StringIO()
+    with redirect_stderr(warning):
+        selected = kakera._telegram_note_images(
+            limited_note, vault, kakera._telegram_image_index(vault)
+        )
+    assert selected == [path.resolve() for path in limited[1:11]]
+    assert "skipped 1 Telegram image(s) over 10 MB" in warning.getvalue()
+    assert "skipped 2 eligible Telegram image(s) after the first 10" in warning.getvalue()
+
+    config = root / "telegram.json"
+    config.write_text(json.dumps({
+        "obsidian": {"vault": str(vault), "notes": "Kakera", "attachments": "attachments"},
+        "telegram": {"chat_id": "-1"},
+    }))
+    with patch.object(kakera, "CONFIG", config), patch.dict(kakera.os.environ, {"TELEGRAM_BOT_TOKEN": "secret"}):
+        root_note = notes / "Example.md"
+        root_note.write_text("![[photo.jpg]]\n")
+        indexed_note = notes / "Indexed.md"
+        indexed_source = "https://www.instagram.com/p/INDEXED/?foo=bar#comments"
+        indexed_base = "https://www.instagram.com/p/INDEXED/"
+        indexed_note.write_text(
+            f'---\ninstagram: "{indexed_source}"\n---\n![[photo.jpg]]\n'
+        )
+        indexed_matches, indexed_selected = kakera._telegram_note_candidates(
+            indexed_source, notes, vault
+        )
+        assert indexed_matches == [indexed_note.resolve()]
+        assert indexed_selected == indexed_base
+        assert kakera._telegram_note_caption(indexed_note, indexed_note.read_text()).endswith(indexed_base)
+        with patch.object(kakera, "telegram_send") as send:
+            assert kakera.telegram_command(["[[Example]]"]) == 1
+            assert kakera.telegram_command(["[[Example.md]]"]) == 1
+            assert not send.called
+
+        leading_config = root / "leading.json"
+        leading_config.write_text(json.dumps({
+            "obsidian": {"vault": str(vault), "notes": "Kakera", "attachments": "attachments"},
+            "telegram": {"chat_id": "00123"},
+        }))
+        with patch.object(kakera, "CONFIG", leading_config):
+            assert kakera.configured_telegram_chat_id() == "123"
+            assert kakera._telegram_receipt(
+                '---\nkakera: {"shared":{"telegram":{"123":[1]}}}\n---\n', "00123"
+            )[1] == [1]
+            for bad in (True, "12x", ""):
+                try:
+                    kakera.canonical_telegram_chat_id(bad)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("accepted invalid Telegram chat ID")
+
+        current = notes / "concurrent.md"
+        current.write_text("![](../photo.jpg)\noriginal\n")
+        def fake_send(*_arguments):
+            current.write_text("![](../photo.jpg)\nconcurrent edit\n")
+            return [99]
+        with patch.object(kakera, "telegram_send", side_effect=fake_send):
+            assert kakera.publish_telegram_note(current, vault) == (
+                True, "Telegram sent 1 image(s) to -1"
+            )
+        assert "concurrent edit" in current.read_text() and '"-1":[99]' in current.read_text()
+        with patch.object(kakera, "telegram_send") as send:
+            assert kakera.publish_telegram_note(current, vault) == (
+                True, "Telegram already sent to -1"
+            )
+            assert not send.called
+
+        duplicate_receipt = notes / "duplicate-receipt.md"
+        duplicate_receipt.write_text(
+            '---\nkakera: {"shared":{"telegram":{"-1":[1,"x"]}}}\n'
+            'kakera: {"shared":{"telegram":{"-1":[2]}}}\n---\n![](../photo.jpg)\n'
+        )
+        with patch.object(kakera, "telegram_send") as send:
+            try:
+                kakera.publish_telegram_note(duplicate_receipt, vault)
+            except ValueError as error:
+                assert "duplicate" in str(error)
+            else:
+                raise AssertionError("accepted duplicate Telegram receipt")
+            assert not send.called
+
+        outside = root / "outside-notes"
+        outside.mkdir()
+        link = vault / "linked-notes"
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            pass
+        else:
+            escaped = root / "escaped.json"
+            escaped.write_text(json.dumps({
+                "obsidian": {"vault": str(vault), "notes": "linked-notes", "attachments": "attachments"},
+                "telegram": {"chat_id": "-1"},
+            }))
+            with patch.object(kakera, "CONFIG", escaped):
+                try:
+                    kakera.telegram_command(["anything"])
+                except ValueError as error:
+                    assert "inside the vault" in str(error)
+                else:
+                    raise AssertionError("accepted notes folder symlink outside vault")
+
+        class TelegramResponse:
+            def __init__(self, body):
+                self.body = body
+            def __enter__(self):
+                return self
+            def __exit__(self, *_arguments):
+                return False
+            def read(self):
+                return self.body
+
+        requests = []
+        with patch.object(
+            kakera, "urlopen",
+            side_effect=lambda request, **_kwargs: (
+                requests.append(request) or TelegramResponse(
+                    b'{"ok":true,"result":[{"message_id":1},{"message_id":2}]}'
+                )
+            ),
+        ):
+            assert kakera.telegram_send("-1", "caption", [image, duplicate]) == [1, 2]
+        assert "sendMediaGroup" in requests[0].full_url
+        assert b'filename="file0.jpg"' in requests[0].data
+        for malformed in (
+            b'{"ok":true,"result":[]}',
+            b'{"ok":true,"result":{"message_id":true}}',
+            b'{"ok":true,"result":{"message_id":0}}',
+        ):
+            with patch.object(kakera, "urlopen", return_value=TelegramResponse(malformed)):
+                try:
+                    kakera.telegram_send("-1", "caption", [image])
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("accepted malformed Telegram message response")
+        with patch.object(
+            kakera, "urlopen",
+            return_value=TelegramResponse(b'{"ok":true,"result":[{"message_id":1}]}'),
+        ):
+            try:
+                kakera.telegram_send("-1", "caption", [image, duplicate])
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("accepted Telegram media count mismatch")
+        with patch.object(kakera, "urlopen", side_effect=OSError("secret token in URL")):
+            try:
+                kakera.telegram_send("-1", "caption", [image])
+            except ValueError as error:
+                assert "secret" not in str(error)
+            else:
+                raise AssertionError("Telegram transport failure was accepted")
+
+        resend = notes / "resend.md"
+        resend.write_text('---\nkakera: {"shared":{"telegram":{"-1":[3]}}}\n---\n![](../photo.jpg)\n')
+        with patch.object(kakera.sys, "stdin", SimpleNamespace(isatty=lambda: False)):
+            try:
+                kakera.publish_telegram_note(resend, vault, manual=True)
+            except ValueError as error:
+                assert "interactive" in str(error)
+            else:
+                raise AssertionError("accepted non-interactive resend")
+        with patch.object(kakera.sys, "stdin", SimpleNamespace(isatty=lambda: True, readline=lambda: "n\n")), \
+             patch.object(kakera, "telegram_send") as send:
+            assert kakera.publish_telegram_note(resend, vault, manual=True) == (True, "resend declined")
+            assert not send.called
+        with patch.object(kakera.sys, "stdin", SimpleNamespace(isatty=lambda: True, readline=lambda: "yes\n")), \
+             patch.object(kakera, "telegram_send", return_value=[4]):
+            assert kakera.publish_telegram_note(resend, vault, manual=True) == (
+                True, "Telegram sent 1 image(s) to -1"
+            )
+        with patch.object(kakera.sys, "stdin", SimpleNamespace(isatty=lambda: True, readline=lambda: "\n")):
+            assert kakera.publish_telegram_note(resend, vault, manual=True) == (True, "resend declined")
+        with patch.object(kakera.sys, "stdin", SimpleNamespace(isatty=lambda: True, readline=lambda: "")):
+            try:
+                kakera.publish_telegram_note(resend, vault, manual=True)
+            except ValueError as error:
+                assert "end of input" in str(error)
+            else:
+                raise AssertionError("accepted EOF resend confirmation")
+        with patch.object(kakera.sys, "stdin", SimpleNamespace(
+            isatty=lambda: True, readline=lambda: (_ for _ in ()).throw(KeyboardInterrupt)
+        )):
+            assert kakera.telegram_command(["resend", "missing"]) == 130
+        failed_note = notes / "failed.md"
+        failed_note.write_text("![](../photo.jpg)\n")
+        original = failed_note.read_text()
+        with patch.object(kakera, "telegram_send", side_effect=ValueError("down")):
+            failed_delivery = kakera.publish_telegram_note(failed_note, vault)
+        assert failed_delivery == (
+            False, "Telegram delivery uncertain; check the configured chat before retrying"
+        )
+        assert failed_note.read_text() == original
+
+
+with TemporaryDirectory() as directory:
+    root = Path(directory)
+    notes, attachments = root / "notes", root / "attachments"
+    notes.mkdir()
+    help_output = io.StringIO()
+    with patch.object(kakera.sys, "argv", ["kakera.py", "--help"]), redirect_stdout(help_output):
+        try:
+            kakera.main()
+        except SystemExit as error:
+            assert error.code == 0
+    help_text = " ".join(help_output.getvalue().split())
+    for phrase in (
+        "kakera --telegram URL [URL ...]",
+        "kakera telegram SELECTOR [SELECTOR ...]",
+        "telegram-only SELECTOR [SELECTOR ...]",
+        "kakera --telegram-only URL [URL ...]",
+        "--tag share/telegram",
+        "save the Capture first",
+        "no durable Kakera output",
+        "URL, or note selector",
+    ):
+        assert phrase in help_text
+    with (
+        patch.object(kakera, "configured_folders", return_value=(notes, attachments)),
+        patch.object(kakera, "save", return_value=(True, "saved")) as save,
+        patch.object(kakera.sys, "argv", ["kakera.py", "--telegram", "one"]),
+    ):
+        assert kakera.main() == 0
+    assert save.call_args.args[-1] == ["share/telegram"]
+
+    with (
+        patch.object(kakera, "configured_folders", side_effect=AssertionError("local used config")),
+        patch.object(kakera, "save", return_value=(True, "saved")) as save,
+        patch.object(kakera.sys, "argv", ["kakera.py", "--local", "--telegram", "one"]),
+    ):
+        assert kakera.main() == 0
+    assert save.call_args.args[2:4] == (kakera.ROOT / "downloads", kakera.ROOT / "attachments")
+
+    for flag, selector in (("--telegram-note", "local"), ("--telegram-note-only", "inbox")):
+        with patch.object(kakera.sys, "argv", ["kakera.py", flag, selector]), \
+             patch.object(kakera, "telegram_command", return_value=0) as note_command, \
+             patch.object(kakera, "telegram_note_only_command", return_value=0) as note_only_command:
+            assert kakera.main() == 0
+        (note_command if flag == "--telegram-note" else note_only_command).assert_called_once_with([selector])
+
+    with patch.object(kakera.sys, "argv", ["kakera.py", "--telegram-only"]), \
+         patch.object(kakera, "configured_telegram_chat_id", side_effect=AssertionError("config before URL")), \
+         patch.object(kakera, "telegram_token", side_effect=AssertionError("token before URL")):
+        try:
+            kakera.main()
+        except SystemExit as error:
+            assert error.code == 2
+        else:
+            raise AssertionError("accepted --telegram-only without a URL")
+
+    queue = root / "inbox.md"
+    queue.write_text("- [ ] https://x.com/a/status/queue\n")
+    with patch.object(kakera, "save", return_value=(False, "capture saved; Telegram failed: down")):
+        assert kakera.process_inbox(queue, None, notes, attachments, tags=["share/telegram"]) == 1
+    assert "[ ]" in queue.read_text()
+
+    for argv, function_name in (
+        (["kakera.py", "--telegram", "--instagram-cookies", "x"], "instagram_cookies"),
+        (["kakera.py", "--telegram", "--reddit-oauth", "x"], "reddit_oauth"),
+        (["kakera.py", "--telegram-note", "--watch", "Note.md"], "telegram_command"),
+        (["kakera.py", "--telegram-only", "--compose", "https://example.test/x"], "telegram_only_url"),
+    ):
+        with patch.object(kakera.sys, "argv", argv), patch.object(kakera, function_name) as called:
+            try:
+                kakera.main()
+            except SystemExit as error:
+                assert error.code == 2
+            else:
+                raise AssertionError("accepted conflicting Telegram grammar")
+            assert not called.called
+
+    todo_config = root / "todo.json"
+    todo_config.write_text(json.dumps({"todoist": {"project_id": "p"}}))
+    task = {"id": "task", "content": "https://x.com/a/status/todo", "labels": []}
+    with (
+        patch.object(kakera, "CONFIG", todo_config),
+        patch.dict(kakera.os.environ, {"TODOIST_API_TOKEN": "token"}),
+        patch.object(kakera, "todoist_task_pages", return_value=iter([[task]])),
+        patch.object(kakera, "todoist_request", return_value={}),
+        patch.object(kakera, "save", return_value=(True, "saved")) as save,
+    ):
+        assert kakera.process_todoist(None, notes, attachments, tags=["share/telegram"]) == 0
+    assert save.call_args.args[-1] == ["share/telegram"]
+
+    watched = root / "watched.md"
+    watched.write_text("# Inbox\n")
+    with patch.object(kakera, "process_inbox", return_value=0) as process, \
+         patch.object(kakera.time, "sleep", side_effect=KeyboardInterrupt):
+        assert kakera.watch_inbox(watched, None, notes, attachments, tags=["share/telegram"]) == 0
+    assert process.call_args.args[-1] == ["share/telegram"]
+
+
+with TemporaryDirectory() as directory:
+    root = Path(directory)
+    vault, notes, attachments = root / "vault", root / "vault" / "notes", root / "vault" / "attachments"
+    notes.mkdir(parents=True)
+    attachments.mkdir()
+    incoming = root / "incoming.jpg"
+    incoming.write_bytes(b"\xff\xd8\xffincoming")
+    config = root / "telegram-capture.json"
+    config.write_text(json.dumps({
+        "obsidian": {"vault": str(vault), "notes": "notes", "attachments": "attachments"},
+        "telegram": {"chat_id": "-1"},
+    }))
+
+    def fake_fetch(url, _browser, _account, _twitter_account, _directory, name):
+        return ({"name": name, "service": "instagram", "url": url,
+                 "metadata": {"title": "Capture", "post_url": url},
+                 "valid": [(incoming, ".jpg")]}, None)
+
+    stored_image = attachments / "capture.jpg"
+    stored_image.write_bytes(incoming.read_bytes())
+    transport_calls = []
+
+    def fake_store(source, _notes, _attachments):
+        source["images"] = [stored_image]
+        return [stored_image]
+
+    with (
+        patch.object(kakera, "CONFIG", config),
+        patch.object(kakera, "fetch_source", side_effect=fake_fetch),
+        patch.object(kakera, "store_source_images", side_effect=fake_store),
+        patch.object(kakera, "telegram_send", side_effect=lambda *args: (transport_calls.append(args) or [7])),
+        patch.dict(kakera.os.environ, {"TELEGRAM_BOT_TOKEN": "token"}),
+    ):
+        success, message = kakera.save(
+            "https://instagram.com/p/CAPTURE", None, notes, attachments, tags=["share/telegram"]
+        )
+        assert success and "Telegram sent 1 image(s) to -1" in message
+        assert len(transport_calls) == 1
+        success, message = kakera.save(
+            "https://instagram.com/p/CAPTURE", None, notes, attachments, tags=["share/telegram"]
+        )
+        assert success and "Telegram already sent to -1" in message
+        assert len(transport_calls) == 1
+
+        old_url = "https://instagram.com/p/OLD"
+        old_note = notes / "Old.md"
+        kakera.write_note(old_note, old_url, [stored_image],
+                          {"title": "Old", "post_url": old_url}, "instagram", ["share/telegram"])
+        success, message = kakera.save(old_url, None, notes, attachments)
+        assert success and "Telegram" not in message
+        assert len(transport_calls) == 1
+        legacy_note = notes / "Legacy.md"
+        kakera.write_note(legacy_note, "https://instagram.com/p/LEGACY", [stored_image],
+                          {"title": "Legacy", "post_url": "https://instagram.com/p/LEGACY"},
+                          "instagram", ["to/telegram"])
+        legacy_success, legacy_message = kakera.save(
+            "https://instagram.com/p/LEGACY", None, notes, attachments
+        )
+        assert legacy_success and "Telegram" not in legacy_message
+        assert len(transport_calls) == 1
+
+        failed_url = "https://instagram.com/p/FAILED"
+        with patch.object(kakera, "_write_telegram_receipt", side_effect=OSError("read-only")):
+            success, message = kakera.save(
+                failed_url, None, notes, attachments, tags=["share/telegram"]
+            )
+        assert not success and message.startswith("capture saved; Telegram failed:")
+        transport_failed_url = "https://instagram.com/p/TRANSPORT-FAILED"
+        with patch.object(kakera, "telegram_send", side_effect=ValueError("timeout")):
+            success, message = kakera.save(
+                transport_failed_url, None, notes, attachments, tags=["share/telegram"]
+            )
+        assert not success and message == (
+            "capture saved; Telegram failed: "
+            "Telegram delivery uncertain; check the configured chat before retrying"
+        )
+
+        compose_success, compose_message = kakera.save_composed(
+            ["https://instagram.com/p/ONE", "https://instagram.com/p/TWO"],
+            None, notes, attachments, tags=["share/telegram"]
+        )
+        assert compose_success and "Telegram sent 1 image(s) to -1" in compose_message
+
+
+with TemporaryDirectory() as directory:
+    root = Path(directory)
+    vault = root / "vault"
+    notes = vault / "notes"
+    attachments = vault / "attachments"
+    notes.mkdir(parents=True)
+    attachments.mkdir()
+    image = notes / "image.jpg"
+    image.write_bytes(b"\xff\xd8\xffimage")
+    config = root / "nested.json"
+    config.write_text(json.dumps({
+        "obsidian": {"vault": str(vault), "notes": "notes", "attachments": "attachments"},
+        "telegram": {"chat_id": "00123"},
+    }))
+    note = notes / "repeat.md"
+    note.write_text(
+        '---\nsource: "https://example.test/repeat"\n'
+        'kakera: {"keep":{"x":[1]},"shared":{"other":{"ok":true}}}\n'
+        '---\n![](image.jpg)\n'
+    )
+    with patch.object(kakera, "CONFIG", config), patch.dict(kakera.os.environ, {"TELEGRAM_BOT_TOKEN": "token"}):
+        assert kakera._telegram_receipt(note.read_text(), "123")[1] is None
+        updated = kakera._set_telegram_receipt(note.read_text(), "00123", [7])
+        assert '"keep":{"x":[1]}' in updated and '"other":{"ok":true}' in updated
+        assert '"123":[7]' in updated
+        old = '---\nto_telegram: {"123":[99]}\n---\n![](image.jpg)\n'
+        assert kakera._telegram_receipt(old, "123")[1] is None
+        nested_only = '---\nmeta:\n  kakera: {"shared":{"telegram":{"123":[9]}}}\n---\nbody\n'
+        assert kakera._telegram_receipt(nested_only, "123")[1] is None
+        nested_updated = kakera._set_telegram_receipt(nested_only, "123", [10])
+        assert '  kakera: {"shared":{"telegram":{"123":[9]}}}' in nested_updated
+        assert nested_updated.endswith("body\n")
+        top_and_nested = (
+            '---\nmeta:\n  kakera: {"keep":true}\n'
+            'kakera: {"shared":{"telegram":{"123":[9]}}}\n---\nbody\n'
+        )
+        top_updated = kakera._set_telegram_receipt(top_and_nested, "123", [10])
+        assert '  kakera: {"keep":true}' in top_updated and '"123":[10]' in top_updated
+        whitespace_only = '---\n kakera: {"shared":{}}\nkakera : {"shared":{}}\n---\nbody\n'
+        whitespace_updated = kakera._set_telegram_receipt(whitespace_only, "123", [11])
+        assert whitespace_updated.count('kakera: {"shared":{"telegram":{"123":[11]}}}') == 1
+        assert ' kakera: {"shared":{}}' in whitespace_updated
+        assert 'kakera : {"shared":{}}' not in whitespace_updated
+        preserved_note = notes / "preserved.md"
+        preserved_note.write_text('---\nkakera: {"unknown":{"value":[1,true]}}\n---\nold\n')
+        kakera.write_note(preserved_note, "https://example.test/preserved", [image],
+                          {"title": "Preserved", "post_url": "https://example.test/preserved"},
+                          "instagram", [])
+        assert '"unknown":{"value":[1,true]}' in preserved_note.read_text()
+        composed_note = notes / "composed.md"
+        composed_note.write_text('---\nkakera: {"unknown":{"nested":{"ok":true}}}\n---\nold\n')
+        kakera.write_composed_note(composed_note, [{
+            "service": "instagram", "url": "https://example.test/composed",
+            "metadata": {"title": "Composed", "post_url": "https://example.test/composed"},
+            "images": [image],
+        }], [])
+        assert '"unknown":{"nested":{"ok":true}}' in composed_note.read_text()
+        for malformed in (
+            '---\nkakera: null\n---\n',
+            '---\nkakera: {"shared":null}\n---\n',
+            '---\nkakera: {"unknown":NaN}\n---\n',
+            '---\nkakera: {"shared":{"other":{"value":Infinity}}}\n---\n',
+            '---\nkakera: {"shared":{}}\nkakera : {"shared":{}}\n---\n',
+            '---\nkakera: {"shared":{"telegram":{"00123":[1],"123":[2]}}}\n---\n',
+            '---\nkakera: {"shared":{"telegram":{"123":[1, true]}}}\n---\n',
+            '---\nkakera: {"shared":{"telegram":{"123":[1]}}}\n'
+            'kakera: {"shared":{"telegram":{"123":[2]}}}\n---\n',
+        ):
+            try:
+                kakera._telegram_receipt(malformed, "123")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("accepted malformed nested Telegram receipt")
+
+        before = note.read_text()
+        sends = []
+        with patch.object(kakera, "telegram_send", side_effect=lambda *args: (sends.append(args) or [8])):
+            assert kakera.telegram_note_only_command(["repeat", "repeat"]) == 0
+        assert len(sends) == 2 and note.read_text() == before
+        note_mtime = note.stat().st_mtime_ns
+        with patch.object(kakera, "fetch_source") as fetch:
+            assert kakera.telegram_note_only_command(["missing-note"]) == 1
+        assert note.stat().st_mtime_ns == note_mtime and not fetch.called
+
+        transient_url = "https://instagram.com/p/TRANSIENT?foo=bar&igsh=tracking#comments"
+        output_roots = {root / "downloads", root / "attachments"}
+        observed = []
+        def fake_transient_fetch(_url, _browser, _account, _twitter, directory, name):
+            path = directory / "source.jpg"
+            path.write_bytes(b"\xff\xd8\xfftemporary")
+            return ({"name": name, "service": "instagram", "url": _url,
+                     "metadata": {"title": "Transient", "post_url": _url},
+                     "valid": [(path, ".jpg")]}, None)
+        def observe_send(_chat, caption, images, _token):
+            observed.append((images[0].exists(), images[0].parent, caption))
+            return [10]
+        with patch.object(kakera, "fetch_source", side_effect=fake_transient_fetch), \
+             patch.object(kakera, "telegram_send", side_effect=observe_send):
+            success, message = kakera.telegram_only_url(transient_url, None)
+        assert success and "nothing saved" in message and observed and observed[0][0]
+        assert observed[0][2].endswith("\nhttps://instagram.com/p/TRANSIENT/")
+        assert not any(path.exists() for path in output_roots)
+        assert not observed[0][1].exists()
+        created = []
+        def failing_fetch(_url, _browser, _account, _twitter, directory, name):
+            created.append(Path(directory))
+            path = Path(directory) / "source.jpg"
+            path.write_bytes(b"\xff\xd8\xfftemporary")
+            return ({"name": name, "service": "instagram", "metadata": {"title": "x"},
+                     "valid": [(path, ".jpg")]}, None)
+        with patch.object(kakera, "fetch_source", side_effect=failing_fetch), \
+             patch.object(kakera, "telegram_send", side_effect=ValueError("api")):
+            success, message = kakera.telegram_only_url(transient_url, None)
+        assert not success and message == "Telegram delivery uncertain; check the configured chat before retrying"
+        assert created and not created[-1].exists()
+        created.clear()
+        def exception_fetch(_url, _browser, _account, _twitter, directory, _name):
+            created.append(Path(directory))
+            raise OSError("fetch")
+        with patch.object(kakera, "fetch_source", side_effect=exception_fetch):
+            try:
+                kakera.telegram_only_url(transient_url, None)
+            except OSError:
+                pass
+            else:
+                raise AssertionError("fetch exception was accepted")
+        assert created and not created[-1].exists()
+        with patch.object(kakera, "fetch_source", side_effect=lambda _url, _browser, _account, _twitter, directory, name: (
+                {"name": name, "service": "instagram", "metadata": {}, "valid": []}, None)):
+            success, message = kakera.telegram_only_url(transient_url, None)
+        assert not success and "Telegram not sent" in message
+        with patch.object(kakera, "fetch_source", return_value=({"valid": [], "error": "partial"}, None)), \
+             patch.object(kakera, "telegram_send") as send:
+            success, message = kakera.telegram_only_url(transient_url, None)
+        assert not success and "Telegram not sent" in message and not send.called
+        with patch.object(kakera.sys, "argv", ["kakera.py", "--telegram-only", transient_url,
+                                                  "https://instagram.com/p/SECOND"]), \
+             patch.object(kakera, "telegram_only_url", side_effect=[
+                 (True, "Telegram sent 1 image(s) to 123; nothing saved"),
+                 (False, "Telegram not sent: failed"),
+             ]) as transient_send:
+            assert kakera.main() == 1
+        assert transient_send.call_count == 2
+        with patch.object(kakera.sys, "argv", ["kakera.py", "--telegram-only", "--browser", "safari", transient_url]), \
+             patch.object(kakera, "telegram_only_url", return_value=(True, "ok")) as allowed:
+            assert kakera.main() == 0
+        assert allowed.call_args.args[1] == "safari"
+
+
+with TemporaryDirectory() as directory:
+    root = Path(directory)
+    fake_bin = root / "bin"
+    fake_bin.mkdir()
+    args_file = root / "args"
+    uv = fake_bin / "uv"
+    uv.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$KAKERA_UV_ARGS\"\n")
+    uv.chmod(0o755)
+    environment = {**os.environ, "PATH": f"{fake_bin}:/usr/bin:/bin", "KAKERA_UV_ARGS": str(args_file)}
+
+    def launcher(*args):
+        result = subprocess.run([str(kakera.ROOT / "kakera"), *args], env=environment,
+                                capture_output=True, text=True)
+        return result.returncode, args_file.read_text().splitlines()
+
+    code, argv = launcher("--telegram-only", "https://example.test/a")
+    assert code == 0 and "--obsidian" not in argv and "--telegram-only" in argv
+    code, argv = launcher("local", "--telegram-only", "https://example.test/a")
+    assert code == 0 and "--local" in argv and "--telegram-only" in argv
+    code, argv = launcher("telegram-only", "Note.md")
+    assert code == 0 and "--telegram-note-only" in argv and "Note.md" in argv
+    code, argv = launcher("telegram", "local")
+    assert code == 0 and "--telegram-note" in argv and "local" in argv
+    code, argv = launcher("telegram-only", "inbox")
+    assert code == 0 and "--telegram-note-only" in argv and "inbox" in argv
+
+    for command in (("local", "telegram-only", "https://example.test/a"),
+                    ("inbox", "telegram-only", "https://example.test/a"),
+                    ("telegram", "telegram-only", "Note.md")):
+        result = subprocess.run(
+            [os.sys.executable, str(kakera.ROOT / "kakera.py"), *command],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 2 and "pseudo-subcommands" in result.stderr
