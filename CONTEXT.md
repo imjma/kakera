@@ -17,7 +17,7 @@ A copy of source images sent by Kakera to its configured Telegram chat, accompan
 _Avoid_: Telegram capture, Telegram source, Telegram post
 
 **Transient Telegram Delivery**:
-A Telegram Delivery from a Submitted Source that is not retained as a Source Note or Attachments. It is not a Capture and has no Share Receipt.
+A Telegram Delivery from a Submitted Source that is not retained as a Source Note or Attachments. It is not a Capture and has no Share Receipt. Inbox and Todoist request one with `share/telegram-only`.
 _Avoid_: Capture, memory-only delivery, receipt-free capture
 
 **Share Receipt**:
@@ -57,8 +57,12 @@ An image referenced by a Source Note and stored under its Source Service in the 
 _Avoid_: Asset, media file, downloaded image
 
 **Inbox**:
-An Obsidian note containing unchecked Markdown tasks whose URLs are waiting to become Captures. A parent task and nested subtasks may form one ordered composition. Successful groups are checked; unsuccessful groups remain pending.
-_Avoid_: Queue database, link file
+An Obsidian note containing unchecked Markdown tasks whose URLs are waiting to become Captures, or Transient Telegram Deliveries when requested with `share/telegram-only`. A parent task and nested subtasks may form one ordered composition. Successful groups are checked; unsuccessful groups remain pending.
+_Avoid_: Queue database, link file, Todoist
+
+**Todoist**:
+An external project of open tasks whose URLs are waiting to become Captures, or Transient Telegram Deliveries when requested with `share/telegram-only`, the same role as the Inbox. A parent task and nested subtasks may form one ordered composition; native labels become Capture Tags except `share/telegram-only`, which is a queue request and is not persisted.
+_Avoid_: Inbox, queue label
 
 **Source Service**:
 The external service associated with a verified Source Post or recognized submitted source. Kakera v0.1 supports Instagram, Twitter (x.com), Reddit, and public RedNote posts.

@@ -79,7 +79,8 @@ folders. Inbox, Todoist, cookie-export, and OAuth commands do not accept URLs.
 | `./kakera inbox` | Process unchecked URL tasks in the configured Obsidian inbox. |
 | `./kakera inbox --watch` | Process the inbox and poll it every 2 seconds until Ctrl-C. |
 | `./kakera todoist` | Process open tasks in the configured Todoist project. |
-| `./kakera todoist --watch` | Process Todoist and poll every 30 seconds until Ctrl-C. |
+| `./kakera todoist --watch` | Process Todoist and poll every 3 minutes until Ctrl-C. |
+| `./kakera inbox --watch --interval 30s` | Override the watch poll interval. `30s`, `3m`, and `1h` are accepted. |
 | `./kakera telegram SELECTOR [SELECTOR ...]` | Publish existing notes from the configured notes folder; acknowledged notes ask before resending. This is manual note publishing, not capture. |
 | `./kakera telegram-only SELECTOR [SELECTOR ...]` | Publish existing notes every time, without reading, prompting on, or writing Telegram receipts. |
 | `./kakera --telegram-only URL [URL ...]` | Fetch each URL to temporary storage and publish it without creating notes, attachments, tags, queues, or receipts. |
@@ -98,6 +99,8 @@ Options may follow the subcommand. These are valid examples:
 ./kakera local --telegram URL
 ./kakera inbox --browser safari --watch
 ./kakera todoist --browser safari --watch
+./kakera inbox --watch --interval 30s
+./kakera todoist --watch --interval 1h
 ./kakera --account personal URL
 ./kakera local --twitter-account imjma URL
 ./kakera --compose URL1 URL2
@@ -185,10 +188,12 @@ Start with this base configuration:
     "vault": "~/Documents/My Vault",
     "notes": "kakera",
     "attachments": "attachments",
-    "inbox": "kakera/inbox.md"
+    "inbox": "kakera/inbox.md",
+    "interval": "2s"
   },
   "todoist": {
-    "project_id": "YOUR_TODOIST_PROJECT_ID"
+    "project_id": "YOUR_TODOIST_PROJECT_ID",
+    "interval": "3m"
   },
   "telegram": {
     "chat_id": "-1001234567890"
@@ -204,6 +209,11 @@ Optional account fragments:
   "twitter": {"account": "imjma"}
 }
 ```
+
+`obsidian.interval` is the Inbox `--watch` poll; `todoist.interval` is the
+Todoist `--watch` poll. Each value is an integer plus `s`, `m`, or `h`. These
+are the built-in defaults; omit a key to keep them. `--interval` overrides the
+matching key for that invocation and requires `--watch`.
 
 `obsidian.vault` is the existing vault directory; `~` is expanded. `notes`,
 `attachments`, and `inbox` are paths relative to that vault: they are the
@@ -333,6 +343,22 @@ For queues, put `#share/telegram` on an unchecked Inbox task or apply the native
 Invocation tags apply to every group in that run and later watch polls. A
 queue item is checked/closed only when capture succeeds; Telegram failure
 keeps it pending.
+
+`share/telegram-only` on an Inbox hashtag, a Todoist label, or `--tag` for
+`inbox`/`todoist` requests a Transient Telegram Delivery instead: each URL is
+sent independently, nothing is stored, and there is no Share Receipt. The group
+is checked/closed only when every URL delivers; any failure keeps it pending.
+If both tags are present, `share/telegram-only` wins. Direct URL captures still
+use `--telegram-only`.
+
+```md
+- [ ] #share/telegram-only https://www.instagram.com/p/ABC/
+```
+
+```sh
+./kakera inbox --tag share/telegram-only
+./kakera todoist --tag share/telegram-only --watch
+```
 
 #### Publish existing notes
 
@@ -496,8 +522,8 @@ only after at least one image is saved.
 Todoist captures are written to the configured `obsidian.notes` and
 `obsidian.attachments` folders. Tasks without a URL remain open; a composition
 with at least one saved image closes its root task even if another source
-failed. If no image is saved, the task remains open. `--watch` polls every 30
-seconds. Native Todoist labels on the parent and nested subtasks become
+failed. If no image is saved, the task remains open. `--watch` polls every 3
+minutes. Override with `--interval` or `todoist.interval`. Native Todoist labels on the parent and nested subtasks become
 Capture Tags in the same depth-first order as their URLs. Add `--tag` for
 invocation-wide tags, including watch mode; hashtags typed in Todoist text are
 not interpreted as labels.
@@ -534,7 +560,8 @@ tasks depth-first; the URL `#photo` fragment above is ignored as a tag. The
 resulting tag order is `research`, `first`, `second`. Successful groups check
 the parent and its subtasks. Failed sources are recorded in the Source Note; if
 no image is saved, the group remains unchecked. `--watch`
-rechecks the file every 2 seconds and stops with Ctrl-C. Add `--tag` to apply
+rechecks the file every 2 seconds and stops with Ctrl-C. Override with
+`--interval` or `obsidian.interval`. Add `--tag` to apply
 an invocation-wide tag to every group, including later groups processed by
 watch mode.
 

@@ -86,6 +86,9 @@ Or keep Kakera polling:
 ./kakera todoist --watch
 ```
 
+`--watch` polls every 3 minutes. Pass `--interval 30s` or set `todoist.interval`
+in `kakera.json` to change that.
+
 Kakera completes the root task after a successful capture. A parent task and its nested subtasks are
 one composition: URLs in the parent are read first, followed by each child
 depth-first, with each task's content before its description. The first URL is
@@ -97,7 +100,10 @@ produces an image, the task stays open for retry.
 Native Todoist labels on the parent and nested subtasks become Capture Tags in
 the same depth-first order as their URLs. Use `--tag` to add tags to every
 capture in an invocation, including watch mode. Hashtags typed in task text
-are not parsed as labels. See the README's [shared Capture Tag rules][tags]
+are not parsed as labels. The `share/telegram-only` label (or `--tag
+share/telegram-only`) requests a Transient Telegram Delivery instead of a
+Capture: each URL is sent independently, nothing is stored, and the root task
+closes only when every URL delivers. See the README's [shared Capture Tag rules][tags]
 for normalization, duplicate handling, and merge order.
 
 ## Troubleshooting

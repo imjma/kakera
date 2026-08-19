@@ -43,11 +43,14 @@ TRACKING_PARAMETERS = {
 }
 INBOX_TASK = re.compile(r"^\s*-\s+\[ \]\s+(https?://\S+)")
 HTTP_URL = re.compile(r"https?://[^\s<>\[\]\"']+")
+INBOX_WATCH_INTERVAL = 2.0
+TODOIST_WATCH_INTERVAL = 180.0
 TODOIST_API = "https://api.todoist.com/api/v1"
 SOURCE_SERVICES = {"instagram", "twitter", "reddit", "rednote"}
 TELEGRAM_API = "https://api.telegram.org"
 TELEGRAM_RECEIPT = "kakera"
 TELEGRAM_TAG = "share/telegram"
+TELEGRAM_ONLY_TAG = "share/telegram-only"
 TELEGRAM_MAX_IMAGES = 10
 TELEGRAM_MAX_BYTES = 10 * 1024 * 1024
 
@@ -271,6 +274,26 @@ def read_config() -> dict:
     if not isinstance(config, dict):
         raise ValueError(f"invalid {CONFIG.name}: expected a JSON object")
     return config
+
+
+def parse_interval(value: str) -> float:
+    match = re.fullmatch(r"([0-9]+)([smh])", value.strip(), re.I) if isinstance(value, str) else None
+    if not match:
+        raise ValueError("must be an integer followed by s, m, or h")
+    amount = int(match.group(1))
+    if amount < 1:
+        raise ValueError("must be at least 1s")
+    return float(amount * {"s": 1, "m": 60, "h": 3600}[match.group(2).casefold()])
+
+
+def configured_interval(section: str, default: float) -> float:
+    data = read_config().get(section)
+    if not isinstance(data, dict) or "interval" not in data:
+        return default
+    try:
+        return parse_interval(data["interval"])
+    except ValueError as error:
+        raise ValueError(f"invalid {CONFIG.name}: {section}.interval {error}") from error
 
 
 def replace_text(temporary: Path, destination: Path) -> None:
@@ -603,6 +626,10 @@ def task_url(task: dict) -> str | None:
     return next(iter(task_urls(task)), None)
 
 
+def process_stamp() -> str:
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
 def process_todoist(
     browser: str | None,
     notes: Path,
@@ -651,10 +678,20 @@ def process_todoist(
             raise ValueError("Todoist returned an invalid task")
         urls = dedupe_urls(list(tree_urls(task))) if hierarchy else dedupe_urls(task_urls(task))
         if not urls:
-            print(f"ok: skipped Todoist task {task.get('id', '?')}: no HTTP(S) URL")
+            print(f"{process_stamp()} ok: skipped Todoist task {task.get('id', '?')}: no HTTP(S) URL")
             continue
         item_tags = queue_tags(list(tree_tags(task))) if hierarchy else queue_tags(task_tags(task))
         capture_tags = merge_tags(item_tags, tags or [])
+        if telegram_only_requested(capture_tags):
+            if not process_transient_urls(urls, browser, account, twitter_account):
+                failed = True
+                continue
+            try:
+                todoist_request(token, f"/tasks/{quote(str(task.get('id', '')), safe='')}/close", "POST")
+            except ValueError as error:
+                print(f"{process_stamp()} error: Todoist task {task.get('id', '?')} was sent but not closed: {error}", file=sys.stderr)
+                failed = True
+            continue
         if len(urls) > 1:
             success, message = (
                 save_composed(urls, browser, notes, attachments, account, twitter_account,
@@ -669,14 +706,14 @@ def process_todoist(
                 if capture_tags else
                 save(urls[0], browser, notes, attachments, account, twitter_account)
             )
-        print(f"{'ok' if success else 'error'}: {', '.join(urls)}: {message}")
+        print(f"{process_stamp()} {'ok' if success else 'error'}: {', '.join(urls)}: {message}")
         if not success:
             failed = True
             continue
         try:
             todoist_request(token, f"/tasks/{quote(str(task.get('id', '')), safe='')}/close", "POST")
         except ValueError as error:
-            print(f"error: Todoist task {task.get('id', '?')} was saved but not closed: {error}", file=sys.stderr)
+            print(f"{process_stamp()} error: Todoist task {task.get('id', '?')} was saved but not closed: {error}", file=sys.stderr)
             failed = True
     return int(failed)
 
@@ -686,7 +723,7 @@ def watch_todoist(
     notes: Path,
     attachments: Path,
     account: str | None = None,
-    interval: float = 30,
+    interval: float = TODOIST_WATCH_INTERVAL,
     twitter_account: str | None = None,
     tags: list[str] | None = None,
 ) -> int:
@@ -844,10 +881,17 @@ def parse_rednote(page: str, source: str) -> tuple[str, dict, list[str]]:
     return f"rednote-{note_id}", metadata, images
 
 
+def rednote_fetch_url(url: str) -> str:
+    parts = urlsplit(url)
+    if parts.scheme.lower() == "http":
+        return urlunsplit(("https", parts.netloc, parts.path, parts.query, parts.fragment))
+    return url
+
+
 def download_rednote(url: str, directory: Path) -> tuple[str, dict]:
     headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) Kakera/0.1"}
     try:
-        with urlopen(Request(url, headers=headers), timeout=30) as response:
+        with urlopen(Request(rednote_fetch_url(url), headers=headers), timeout=30) as response:
             page = response.read(5 * 1024 * 1024 + 1)
             final_url = response.url
         if len(page) > 5 * 1024 * 1024:
@@ -1804,6 +1848,24 @@ def telegram_requested(tags: list[str] | None) -> bool:
     return any(isinstance(tag, str) and tag.casefold() == TELEGRAM_TAG for tag in tags or [])
 
 
+def telegram_only_requested(tags: list[str] | None) -> bool:
+    return any(isinstance(tag, str) and tag.casefold() == TELEGRAM_ONLY_TAG for tag in tags or [])
+
+
+def process_transient_urls(
+    urls: list[str],
+    browser: str | None,
+    account: str | None,
+    twitter_account: str | None,
+) -> bool:
+    failed = False
+    for url in urls:
+        success, message = telegram_only_url(url, browser, account, twitter_account)
+        print(f"{process_stamp()} {'ok' if success else 'error'}: {url}: {message}")
+        failed |= not success
+    return not failed
+
+
 def capture_telegram_vault(notes: Path) -> Path:
     try:
         configured = read_config().get("obsidian", {}).get("vault")
@@ -2234,6 +2296,15 @@ def process_inbox(
             continue
         urls = group["urls"]
         capture_tags = merge_tags(group.get("tags", []), tags or [])
+        if telegram_only_requested(capture_tags):
+            success = process_transient_urls(urls, browser, account, twitter_account)
+            if success:
+                completion_failed = mark_completed_signature(inbox, signature)
+                failed |= completion_failed
+                if completion_failed:
+                    completed.add(signature)
+            failed |= not success
+            continue
         if len(urls) > 1:
             success, message = (
                 save_composed(urls, browser, notes, attachments, account, twitter_account,
@@ -2248,7 +2319,7 @@ def process_inbox(
                 if capture_tags else
                 save(urls[0], browser, notes, attachments, account, twitter_account)
             )
-        print(f"{'ok' if success else 'error'}: {', '.join(urls)}: {message}")
+        print(f"{process_stamp()} {'ok' if success else 'error'}: {', '.join(urls)}: {message}")
         if success:
             completion_failed = mark_completed_signature(inbox, signature)
             failed |= completion_failed
@@ -2411,7 +2482,7 @@ def watch_inbox(
     notes: Path,
     attachments: Path,
     account: str | None = None,
-    interval: float = 2,
+    interval: float = INBOX_WATCH_INTERVAL,
     twitter_account: str | None = None,
     tags: list[str] | None = None,
 ) -> int:
@@ -2428,9 +2499,7 @@ def watch_inbox(
                     previous = None
                 else:
                     current = read_inbox(inbox)
-                    if current != previous:
-                        process_inbox(inbox, browser, notes, attachments, account, completed, False, twitter_account, tags)
-                    elif completed:
+                    if current != previous or completed:
                         process_inbox(inbox, browser, notes, attachments, account, completed, False, twitter_account, tags)
                     previous = read_inbox(inbox)
                 reported_error = None
@@ -2466,6 +2535,8 @@ def main() -> int:
     parser.add_argument("--obsidian", action="store_true", help=f"use folders from {CONFIG.name}")
     parser.add_argument("--inbox", action="store_true", help="process unchecked links in the Obsidian inbox")
     parser.add_argument("--watch", action="store_true", help="keep watching the inbox or Todoist")
+    parser.add_argument("--interval", metavar="DURATION",
+                        help="watch poll interval, e.g. 30s, 3m, 1h")
     parser.add_argument("--todoist", action="store_true", help="process open Todoist tasks")
     parser.add_argument("--compose", action="store_true",
                         help="compose multiple URLs into one Source Note")
@@ -2497,6 +2568,14 @@ def main() -> int:
                      arguments.twitter_cookies is not None or
                      arguments.reddit_oauth is not None):
         parser.error("--tag requires a capture command")
+    if telegram_only_requested(cli_tags) and not arguments.inbox and not arguments.todoist:
+        parser.error("--tag share/telegram-only requires --inbox or --todoist")
+    cli_interval = None
+    if arguments.interval is not None:
+        try:
+            cli_interval = parse_interval(arguments.interval)
+        except ValueError as error:
+            parser.error(f"interval {error}")
     auth_options = (
         arguments.instagram_cookies is not None, arguments.twitter_cookies is not None,
         arguments.reddit_oauth is not None,
@@ -2505,7 +2584,8 @@ def main() -> int:
         parser.error("--telegram cannot be combined with cookie export or Reddit OAuth")
     if (arguments.telegram_only and (arguments.telegram or arguments.compose or arguments.local or
                                       arguments.obsidian or arguments.inbox or arguments.todoist or
-                                      arguments.watch or arguments.tag or any(auth_options))):
+                                      arguments.watch or arguments.interval or arguments.tag or
+                                      any(auth_options))):
         parser.error("--telegram-only accepts URLs and source account options only")
     if arguments.telegram_note or arguments.telegram_note_only:
         if not arguments.urls:
@@ -2513,7 +2593,7 @@ def main() -> int:
         if (arguments.browser or arguments.account or arguments.twitter_account or
                 any(auth_options) or arguments.obsidian or arguments.inbox or arguments.watch or
                 arguments.todoist or arguments.compose or arguments.telegram or arguments.telegram_only or
-                arguments.local or arguments.tag):
+                arguments.local or arguments.tag or arguments.interval):
             parser.error("telegram note publishing accepts selectors only")
         try:
             return (telegram_note_only_command(arguments.urls) if arguments.telegram_note_only
@@ -2546,6 +2626,8 @@ def main() -> int:
         return int(failed)
     if arguments.telegram:
         cli_tags = merge_tags(cli_tags, [TELEGRAM_TAG])
+    if arguments.interval is not None and not arguments.watch:
+        parser.error("--interval requires --watch")
 
     if arguments.instagram_cookies is not None:
         if arguments.urls:
@@ -2601,8 +2683,13 @@ def main() -> int:
         if arguments.urls:
             parser.error("--inbox does not accept URLs")
         try:
-            function = watch_inbox if arguments.watch else process_inbox
-            return function(
+            if arguments.watch:
+                return watch_inbox(
+                    configured_inbox(), browser, notes, attachments, account,
+                    cli_interval if cli_interval is not None else configured_interval("obsidian", INBOX_WATCH_INTERVAL),
+                    twitter_account=twitter_account, tags=cli_tags,
+                )
+            return process_inbox(
                 configured_inbox(), browser, notes, attachments, account,
                 twitter_account=twitter_account, tags=cli_tags,
             )
@@ -2614,8 +2701,13 @@ def main() -> int:
         if arguments.compose:
             parser.error("--compose is automatic for Todoist task groups")
         try:
-            function = watch_todoist if arguments.watch else process_todoist
-            return function(
+            if arguments.watch:
+                return watch_todoist(
+                    browser, notes, attachments, account,
+                    cli_interval if cli_interval is not None else configured_interval("todoist", TODOIST_WATCH_INTERVAL),
+                    twitter_account=twitter_account, tags=cli_tags,
+                )
+            return process_todoist(
                 browser, notes, attachments, account,
                 twitter_account=twitter_account, tags=cli_tags,
             )
@@ -2633,7 +2725,7 @@ def main() -> int:
         else:
             success, message = save_composed(arguments.urls, browser, notes, attachments,
                                               account, twitter_account)
-        print(f"{'ok' if success else 'error'}: {', '.join(arguments.urls)}: {message}")
+        print(f"{process_stamp()} {'ok' if success else 'error'}: {', '.join(arguments.urls)}: {message}")
         return int(not success)
     failed = False
     for url in arguments.urls:
@@ -2641,7 +2733,7 @@ def main() -> int:
             success, message = save(url, browser, notes, attachments, account, twitter_account, cli_tags)
         else:
             success, message = save(url, browser, notes, attachments, account, twitter_account)
-        print(f"{'ok' if success else 'error'}: {url}: {message}")
+        print(f"{process_stamp()} {'ok' if success else 'error'}: {url}: {message}")
         failed |= not success
     return int(failed)
 

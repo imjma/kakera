@@ -50,6 +50,19 @@ def _process_store_worker(incoming, attachment_root, extension, queue, name="ins
         queue.put(("error", repr(error), None))
 
 
+assert kakera.parse_interval("30s") == 30
+assert kakera.parse_interval("3m") == 180
+assert kakera.parse_interval("1h") == 3600
+assert kakera.parse_interval("3M") == 180
+assert kakera.parse_interval(" 2H ") == 7200
+for bad in ("", "30", "1.5m", "1h30m", "0s", "0m", "-3m", "3min", "3 minutes", "s", "3", "3mm"):
+    try:
+        kakera.parse_interval(bad)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"accepted invalid interval {bad!r}")
+
 assert capture_id("https://www.instagram.com/p/ABC_123/?igsh=tracking") == "instagram-ABC_123"
 for shape in ("p", "reel", "tv"):
     indexed = f"https://www.instagram.com/{shape}/DbqJEsLna8A/?foo=bar&igsh=tracking#comments"
@@ -73,6 +86,8 @@ assert capture_id("https://redd.it/1abcxyz?utm_source=share") == "reddit-1abcxyz
 assert canonical_url("https://redd.it/1abcxyz/?utm_source=x&keep=yes#top") == "https://redd.it/1abcxyz?keep=yes"
 assert capture_id("http://xhslink.com/o/ABC").startswith("rednote-")
 assert capture_id("http://xhslink.com/m/1JXFZx4ards") == "rednote-1JXFZx4ards"
+assert kakera.rednote_fetch_url("http://xhslink.com/m/63svxwTvG5d") == "https://xhslink.com/m/63svxwTvG5d"
+assert kakera.rednote_fetch_url("https://xhslink.com/m/63svxwTvG5d") == "https://xhslink.com/m/63svxwTvG5d"
 assert capture_id("https://x.com/artist/status/123456789") == "twitter-123456789"
 assert capture_id("https://www.twitter.com/artist/status/123456789/?s=20") == "twitter-123456789"
 assert capture_id("https://mobile.x.com/i/web/status/123456789") == "twitter-123456789"
@@ -1019,20 +1034,32 @@ with TemporaryDirectory() as directory:
 
 with TemporaryDirectory() as directory:
     root = Path(directory)
+    capture_output = io.StringIO()
     with (
         patch.object(kakera, "save", return_value=(True, "saved")) as save,
         patch.object(kakera, "save_composed", return_value=(True, "composed")) as composed,
         patch.object(kakera.sys, "argv", ["kakera.py", "one", "two"]),
+        redirect_stdout(capture_output),
     ):
         assert main() == 0
         assert save.call_count == 2 and not composed.called
+    assert re.fullmatch(
+        r"(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ok: (?:one|two): saved\n){2}",
+        capture_output.getvalue(),
+    )
+    compose_output = io.StringIO()
     with (
         patch.object(kakera, "save", return_value=(True, "saved")) as save,
         patch.object(kakera, "save_composed", return_value=(True, "composed")) as composed,
         patch.object(kakera.sys, "argv", ["kakera.py", "--compose", "one", "two"]),
+        redirect_stdout(compose_output),
     ):
         assert main() == 0
         assert not save.called and composed.call_args.args[0] == ["one", "two"]
+    assert re.fullmatch(
+        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ok: one, two: composed\n",
+        compose_output.getvalue(),
+    )
 
     duplicate = ["https://x.com/a/status/1?utm_source=x", "https://x.com/a/status/1/"]
     with patch.object(kakera, "save", return_value=(True, "saved")) as save:
@@ -2195,11 +2222,48 @@ with TemporaryDirectory() as directory:
         assert kakera.process_inbox(queue, None, notes, attachments, tags=["share/telegram"]) == 1
     assert "[ ]" in queue.read_text()
 
+    only_queue = root / "only.md"
+    only_queue.write_text(
+        "- [ ] #share/telegram-only https://x.com/a/status/one\n"
+        "  - [ ] https://x.com/a/status/two\n"
+    )
+    with patch.object(kakera, "save") as save, \
+         patch.object(kakera, "telegram_only_url", return_value=(True, "Telegram sent 1 image(s) to 1; nothing saved")) as send:
+        assert kakera.process_inbox(only_queue, None, notes, attachments) == 0
+    assert not save.called
+    assert [call.args[0] for call in send.call_args_list] == [
+        "https://x.com/a/status/one", "https://x.com/a/status/two",
+    ]
+    assert "[ ]" not in only_queue.read_text()
+
+    mixed_queue = root / "mixed.md"
+    mixed_queue.write_text("- [ ] #share/telegram #share/telegram-only https://x.com/a/status/mix\n")
+    with patch.object(kakera, "save") as save, \
+         patch.object(kakera, "telegram_only_url", return_value=(True, "sent")) as send:
+        assert kakera.process_inbox(mixed_queue, None, notes, attachments) == 0
+    assert not save.called and send.called
+
+    partial_queue = root / "partial.md"
+    partial_queue.write_text(
+        "- [ ] #share/telegram-only https://x.com/a/status/ok\n"
+        "  - [ ] https://x.com/a/status/bad\n"
+    )
+    with patch.object(kakera, "save") as save, \
+         patch.object(kakera, "telegram_only_url", side_effect=[
+             (True, "sent"), (False, "Telegram not sent: failed"),
+         ]):
+        assert kakera.process_inbox(partial_queue, None, notes, attachments) == 1
+    assert not save.called
+    assert "[ ]" in partial_queue.read_text()
+
     for argv, function_name in (
         (["kakera.py", "--telegram", "--instagram-cookies", "x"], "instagram_cookies"),
         (["kakera.py", "--telegram", "--reddit-oauth", "x"], "reddit_oauth"),
         (["kakera.py", "--telegram-note", "--watch", "Note.md"], "telegram_command"),
+        (["kakera.py", "--telegram-note", "--interval", "3m", "Note.md"], "telegram_command"),
         (["kakera.py", "--telegram-only", "--compose", "https://example.test/x"], "telegram_only_url"),
+        (["kakera.py", "--telegram-only", "--interval", "3m", "https://example.test/x"], "telegram_only_url"),
+        (["kakera.py", "--tag", "share/telegram-only", "https://x.com/a/status/1"], "save"),
     ):
         with patch.object(kakera.sys, "argv", argv), patch.object(kakera, function_name) as called:
             try:
@@ -2213,15 +2277,35 @@ with TemporaryDirectory() as directory:
     todo_config = root / "todo.json"
     todo_config.write_text(json.dumps({"todoist": {"project_id": "p"}}))
     task = {"id": "task", "content": "https://x.com/a/status/todo", "labels": []}
+    todoist_output = io.StringIO()
     with (
         patch.object(kakera, "CONFIG", todo_config),
         patch.dict(kakera.os.environ, {"TODOIST_API_TOKEN": "token"}),
         patch.object(kakera, "todoist_task_pages", return_value=iter([[task]])),
         patch.object(kakera, "todoist_request", return_value={}),
         patch.object(kakera, "save", return_value=(True, "saved")) as save,
+        redirect_stdout(todoist_output),
     ):
         assert kakera.process_todoist(None, notes, attachments, tags=["share/telegram"]) == 0
     assert save.call_args.args[-1] == ["share/telegram"]
+    assert re.fullmatch(
+        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ok: https://x.com/a/status/todo: saved\n",
+        todoist_output.getvalue(),
+    )
+
+    only_task = {"id": "only", "content": "https://x.com/a/status/only",
+                 "labels": ["share/telegram", "share/telegram-only"]}
+    with (
+        patch.object(kakera, "CONFIG", todo_config),
+        patch.dict(kakera.os.environ, {"TODOIST_API_TOKEN": "token"}),
+        patch.object(kakera, "todoist_task_pages", return_value=iter([[only_task]])),
+        patch.object(kakera, "todoist_request", return_value={}) as close,
+        patch.object(kakera, "save") as save,
+        patch.object(kakera, "telegram_only_url", return_value=(True, "sent")) as send,
+    ):
+        assert kakera.process_todoist(None, notes, attachments) == 0
+    assert not save.called and send.called
+    assert "/tasks/only/close" in close.call_args.args[1]
 
     watched = root / "watched.md"
     watched.write_text("# Inbox\n")
@@ -2229,6 +2313,114 @@ with TemporaryDirectory() as directory:
          patch.object(kakera.time, "sleep", side_effect=KeyboardInterrupt):
         assert kakera.watch_inbox(watched, None, notes, attachments, tags=["share/telegram"]) == 0
     assert process.call_args.args[-1] == ["share/telegram"]
+
+
+with TemporaryDirectory() as directory:
+    root = Path(directory)
+    vault, notes, attachments = root / "vault", root / "vault" / "notes", root / "vault" / "assets"
+    notes.mkdir(parents=True)
+    attachments.mkdir()
+    inbox = vault / "inbox.md"
+    inbox.write_text("# Inbox\n")
+    config = root / "kakera.json"
+    base_config = {
+        "obsidian": {
+            "vault": str(vault),
+            "notes": "notes",
+            "attachments": "assets",
+            "inbox": "inbox.md",
+        },
+        "todoist": {"project_id": "p"},
+    }
+    config.write_text(json.dumps(base_config))
+
+    def watch_sleep(argv, data=None):
+        if data is not None:
+            config.write_text(json.dumps(data))
+        with (
+            patch.object(kakera, "CONFIG", config),
+            patch.object(kakera, "process_inbox", return_value=0),
+            patch.object(kakera, "process_todoist", return_value=0),
+            patch.object(kakera.time, "sleep", side_effect=KeyboardInterrupt) as sleep,
+            patch.object(kakera.sys, "argv", argv),
+            patch.dict(kakera.os.environ, {"TODOIST_API_TOKEN": "token"}),
+        ):
+            assert kakera.main() == 0
+        return sleep.call_args.args[0]
+
+    assert watch_sleep(["kakera.py", "--inbox", "--watch"]) == kakera.INBOX_WATCH_INTERVAL
+    assert watch_sleep(["kakera.py", "--todoist", "--watch"]) == kakera.TODOIST_WATCH_INTERVAL
+    configured = {
+        **base_config,
+        "obsidian": {**base_config["obsidian"], "interval": "5s"},
+        "todoist": {"project_id": "p", "interval": "10m"},
+    }
+    assert watch_sleep(["kakera.py", "--inbox", "--watch"], configured) == 5
+    assert watch_sleep(["kakera.py", "--todoist", "--watch"]) == 600
+    assert watch_sleep(["kakera.py", "--inbox", "--watch", "--interval", "45s"]) == 45
+    assert watch_sleep(["kakera.py", "--todoist", "--watch", "--interval", "1h"]) == 3600
+
+    config.write_text(json.dumps({
+        **base_config,
+        "obsidian": {**base_config["obsidian"], "interval": "nope"},
+        "todoist": {"project_id": "p", "interval": "nope"},
+    }))
+    with (
+        patch.object(kakera, "CONFIG", config),
+        patch.object(kakera, "process_inbox", return_value=0) as process,
+        patch.object(kakera.sys, "argv", ["kakera.py", "--inbox"]),
+    ):
+        assert kakera.main() == 0
+    assert process.called
+    with (
+        patch.object(kakera, "CONFIG", config),
+        patch.object(kakera, "process_todoist", return_value=0) as process,
+        patch.object(kakera.sys, "argv", ["kakera.py", "--todoist"]),
+        patch.dict(kakera.os.environ, {"TODOIST_API_TOKEN": "token"}),
+    ):
+        assert kakera.main() == 0
+    assert process.called
+    with (
+        patch.object(kakera, "CONFIG", config),
+        patch.object(kakera, "watch_inbox") as watch,
+        patch.object(kakera.sys, "argv", ["kakera.py", "--inbox", "--watch"]),
+        redirect_stderr(io.StringIO()),
+    ):
+        try:
+            kakera.main()
+        except SystemExit as error:
+            assert error.code == 2
+        else:
+            raise AssertionError("accepted invalid obsidian.interval")
+        assert not watch.called
+    with (
+        patch.object(kakera, "CONFIG", config),
+        patch.object(kakera, "watch_todoist") as watch,
+        patch.object(kakera.sys, "argv", ["kakera.py", "--todoist", "--watch"]),
+        patch.dict(kakera.os.environ, {"TODOIST_API_TOKEN": "token"}),
+        redirect_stderr(io.StringIO()),
+    ):
+        try:
+            kakera.main()
+        except SystemExit as error:
+            assert error.code == 2
+        else:
+            raise AssertionError("accepted invalid todoist.interval")
+        assert not watch.called
+
+    for argv in (
+        ["kakera.py", "--interval", "3m", "https://x.com/a/status/1"],
+        ["kakera.py", "--inbox", "--interval", "3m"],
+        ["kakera.py", "--interval", "0s", "--watch", "--inbox"],
+        ["kakera.py", "--interval", "30", "--watch", "--inbox"],
+    ):
+        with patch.object(kakera.sys, "argv", argv), redirect_stderr(io.StringIO()):
+            try:
+                kakera.main()
+            except SystemExit as error:
+                assert error.code == 2
+            else:
+                raise AssertionError(f"accepted {argv}")
 
 
 with TemporaryDirectory() as directory:

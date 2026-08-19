@@ -4,10 +4,12 @@
     "vault": "~/Documents/My Vault",
     "notes": "kakera",
     "attachments": "attachments",
-    "inbox": "kakera/inbox.md"
+    "inbox": "kakera/inbox.md",
+    "interval": "2s"
   },
   "todoist": {
-    "project_id": "YOUR_TODOIST_PROJECT_ID"
+    "project_id": "YOUR_TODOIST_PROJECT_ID",
+    "interval": "3m"
   },
   "telegram": {
     "chat_id": "-1001234567890"
