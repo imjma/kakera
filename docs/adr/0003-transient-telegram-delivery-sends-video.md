@@ -1,0 +1,3 @@
+# Transient Telegram Delivery is the only video path
+
+Video from Instagram, Twitter, Reddit, and RedNote is sent only as a Transient Telegram Delivery (`--telegram-only` / queue `share/telegram-only`). Capture, `share/telegram`, and note publishing stay image-only and do not download video, so a video-only Source Post still cannot become a Capture and still cannot carry a Share Receipt. Storing video as an Attachment was rejected for this stage: it would change the vault model and reverse ADR 0002’s “save then deliver from local files” rule, while a hybrid “send video but do not keep it” on `share/telegram` would deliver without a Capture to hang a receipt on.

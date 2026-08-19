@@ -69,6 +69,18 @@ for shape in ("p", "reel", "tv"):
     base = f"https://www.instagram.com/{shape}/DbqJEsLna8A/"
     assert kakera.normalize_instagram_post_url(indexed) == base
     assert canonical_url(indexed) == base.rstrip("/")
+assert kakera.normalize_instagram_post_url(
+    "https://www.instagram.com/reels/DZ20GT0pLMa/?igsh=tracking"
+) == "https://www.instagram.com/reel/DZ20GT0pLMa/"
+assert capture_id("https://www.instagram.com/reels/DZ20GT0pLMa/") == "instagram-DZ20GT0pLMa"
+assert canonical_url("https://www.instagram.com/reels/DZ20GT0pLMa/") == canonical_url(
+    "https://www.instagram.com/reel/DZ20GT0pLMa/"
+)
+assert kakera.published_url(
+    "https://www.instagram.com/reel/DZ20GT0pLMa/?utm_source=ig_web_copy_link"
+    "&igsh=NTc4MTIwNjQ2YQ==&igsi=NTc4MTIwNjQ2YQ=="
+) == "https://www.instagram.com/reel/DZ20GT0pLMa/"
+assert kakera.published_url("https://x.com/a/status/1?utm_source=share&s=20") == "https://x.com/a/status/1?s=20"
 assert canonical_url("https://x.com/a/status/1?keep=yes#fragment") == "https://x.com/a/status/1?keep=yes"
 assert kakera.dedupe_urls([
     "https://www.instagram.com/p/DbqJEsLna8A/?foo=bar",
@@ -156,16 +168,117 @@ with TemporaryDirectory() as directory:
     assert destination.read_text() == "updated"
 
 rednote_page = """<script>window.__INITIAL_STATE__={"global":{"value":undefined},"note":{"noteDetailMap":{"id":{"note":{"noteId":"abc123","title":"A note","desc":"Caption","time":1784807339000,"user":{"userId":"user1","nickname":"Artist"},"imageList":[{"urlDefault":"http://example.com/image"}]}}}}}</script>"""
-rednote_name, rednote_metadata, rednote_images = parse_rednote(rednote_page, "http://xhslink.com/o/ABC")
+rednote_name, rednote_metadata, rednote_images, rednote_video = parse_rednote(rednote_page, "http://xhslink.com/o/ABC")
 assert rednote_name == "rednote-abc123"
 assert rednote_metadata["author"] == "Artist"
 assert rednote_metadata["post_url"] == "http://xhslink.com/o/ABC"
 assert rednote_images == ["https://example.com/image"]
+assert rednote_video is None
 
 unsafe_rednote_page = rednote_page.replace('"noteId":"abc123"', '"noteId":"../escape"')
-unsafe_name, _, _ = parse_rednote(unsafe_rednote_page, "http://xhslink.com/o/ABC")
-unsafe_name_again, _, _ = parse_rednote(unsafe_rednote_page, "http://xhslink.com/o/ABC")
+unsafe_name, _, _, _ = parse_rednote(unsafe_rednote_page, "http://xhslink.com/o/ABC")
+unsafe_name_again, _, _, _ = parse_rednote(unsafe_rednote_page, "http://xhslink.com/o/ABC")
 assert unsafe_name == unsafe_name_again and re.fullmatch(r"rednote-[A-Za-z0-9_-]{1,100}", unsafe_name)
+
+rednote_video_page = rednote_page.replace(
+    '"imageList":[{"urlDefault":"http://example.com/image"}]',
+    '"imageList":[{"urlDefault":"http://example.com/cover"}],'
+    '"video":{"media":{"stream":{"h264":[{"masterUrl":"http://cdn.example/video.mp4"}]}}}',
+)
+_, _, cover_images, cover_video = parse_rednote(rednote_video_page, "http://xhslink.com/o/VID")
+assert cover_images == ["https://example.com/cover"]
+assert cover_video == "https://cdn.example/video.mp4"
+video_only_page = rednote_page.replace(
+    '"imageList":[{"urlDefault":"http://example.com/image"}]',
+    '"imageList":[],"video":{"media":{"stream":{"h264":[{"masterUrl":"https://cdn.example/only.mp4"}]}}}',
+)
+_, _, empty_images, only_video = parse_rednote(video_only_page, "http://xhslink.com/o/ONLY")
+assert empty_images == [] and only_video == "https://cdn.example/only.mp4"
+
+with TemporaryDirectory() as directory:
+    probe = Path(directory)
+    mp4 = probe / "clip.mp4"
+    mp4.write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2")
+    heic = probe / "still.heic"
+    heic.write_bytes(b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic")
+    avif = probe / "still.avif"
+    avif.write_bytes(b"\x00\x00\x00\x18ftypavif\x00\x00\x00\x00avif")
+    webm = probe / "clip.webm"
+    webm.write_bytes(b"\x1a\x45\xdf\xa3" + b"\x00" * 12)
+    jpeg = probe / "still.jpg"
+    jpeg.write_bytes(b"\xff\xd8\xff\xe0image")
+    assert kakera.video_extension(mp4) == ".mp4" and kakera.image_extension(mp4) is None
+    assert kakera.image_extension(heic) == ".heic" and kakera.video_extension(heic) is None
+    assert kakera.image_extension(avif) == ".avif" and kakera.video_extension(avif) is None
+    assert kakera.video_extension(webm) is None and kakera.image_extension(webm) is None
+    assert kakera.media_extension(mp4) is None
+    assert kakera.media_extension(mp4, allow_video=True) == ".mp4"
+    assert kakera.media_extension(jpeg, allow_video=True) == ".jpg"
+    assert kakera._telegram_count_label([jpeg, mp4]) == "1 image and 1 video"
+    assert kakera._telegram_count_label([mp4]) == "1 video"
+    assert kakera._telegram_count_label([jpeg, jpeg]) == "2 images"
+
+    class RedNoteResponse:
+        def __init__(self, body, url="https://www.xiaohongshu.com/explore/abc123"):
+            self.body = body
+            self.url = url
+        def __enter__(self):
+            return self
+        def __exit__(self, *_arguments):
+            return False
+        def read(self, _limit=-1):
+            return self.body
+
+    def rednote_urlopen(request, **_):
+        url = request.full_url
+        if "video.mp4" in url:
+            return RedNoteResponse(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2", url)
+        if "example.com" in url or "cover" in url:
+            return RedNoteResponse(b"\xff\xd8\xffcover", url)
+        return RedNoteResponse(rednote_video_page.encode(), url)
+
+    capture_dir = probe / "rednote-capture"
+    capture_dir.mkdir()
+    with patch.object(kakera, "urlopen", side_effect=rednote_urlopen):
+        name, metadata = kakera.download_rednote("http://xhslink.com/o/VID", capture_dir)
+    assert name == "rednote-abc123"
+    assert list(capture_dir.iterdir()) and not list(capture_dir.glob("*.video"))
+    transient_rednote = probe / "rednote-transient"
+    transient_rednote.mkdir()
+    with patch.object(kakera, "urlopen", side_effect=rednote_urlopen):
+        kakera.download_rednote("http://xhslink.com/o/VID", transient_rednote, include_video=True)
+    written = sorted(path.name for path in transient_rednote.iterdir())
+    assert written == ["01.image", "02.video"]
+    assert kakera.image_extension(transient_rednote / "01.image") == ".jpg"
+    assert kakera.video_extension(transient_rednote / "02.video") == ".mp4"
+
+    video_only_dir = probe / "rednote-video-only"
+    video_only_dir.mkdir()
+    def video_only_urlopen(request, **_):
+        url = request.full_url
+        if "only.mp4" in url:
+            return RedNoteResponse(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2", url)
+        return RedNoteResponse(video_only_page.encode(), url)
+    with patch.object(kakera, "urlopen", side_effect=video_only_urlopen):
+        try:
+            kakera.download_rednote("http://xhslink.com/o/ONLY", video_only_dir)
+        except ValueError as error:
+            assert "no public images" in str(error)
+        else:
+            raise AssertionError("capture accepted a video-only RedNote note")
+        kakera.download_rednote("http://xhslink.com/o/ONLY", video_only_dir, include_video=True)
+    assert kakera.video_extension(video_only_dir / "01.video") == ".mp4"
+
+    huge_video = probe / "huge.mp4"
+    huge_video.write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2")
+    huge_video.open("ab").truncate(kakera.TELEGRAM_MAX_VIDEO_BYTES + 1)
+    ok_video = probe / "ok.mp4"
+    ok_video.write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2")
+    warning = io.StringIO()
+    with redirect_stderr(warning):
+        selected = kakera._telegram_filter_images([huge_video, ok_video, jpeg], allow_video=True)
+    assert selected == [ok_video.resolve(), jpeg.resolve()]
+    assert "video(s) over 50 MB" in warning.getvalue()
 
 with TemporaryDirectory() as directory:
     root = Path(directory)
@@ -174,7 +287,7 @@ with TemporaryDirectory() as directory:
     note.parent.mkdir()
     write_note(
         note,
-        "https://www.instagram.com/p/ABC_123/",
+        "https://www.instagram.com/p/ABC_123/?utm_source=ig_web_copy_link&igsh=x&igsi=y",
         [image],
         {
             "description": "A caption\nwith body text",
@@ -481,6 +594,36 @@ with TemporaryDirectory() as directory:
         )
     assert not success
     assert message == "no supported images found"
+
+    def fake_instagram_video_only(command, **_):
+        assert "-o" in command and "extractor.instagram.videos=false" in command
+        target = Path(command[command.index("--directory") + 1]) / "video.mp4"
+        target.write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2")
+        return CompletedProcess(command, 0, "", "")
+
+    with patch.object(kakera.subprocess, "run", side_effect=fake_instagram_video_only):
+        success, message = kakera.save(
+            "https://www.instagram.com/reel/VIDEOONLY/", None,
+            root / "downloads", root / "attachments",
+        )
+    assert not success
+    assert message == "no supported images found"
+
+    transient_dir = root / "transient-video"
+    transient_dir.mkdir()
+    def fake_transient_video(command, **_):
+        assert "extractor.instagram.videos=false" not in command
+        target = Path(command[command.index("--directory") + 1]) / "reel.mp4"
+        target.write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2")
+        return CompletedProcess(command, 0, str(target), "")
+
+    with patch.object(kakera.subprocess, "run", side_effect=fake_transient_video):
+        source, error = kakera.fetch_source(
+            "https://www.instagram.com/reel/VIDEOONLY/", None, None, None,
+            transient_dir, "instagram-VIDEOONLY", include_video=True,
+        )
+    assert error is None and source is not None
+    assert [extension for _, extension in source["valid"]] == [".mp4"]
 
 with TemporaryDirectory() as directory:
     root = Path(directory)
@@ -2089,6 +2232,29 @@ with TemporaryDirectory() as directory:
             assert kakera.telegram_send("-1", "caption", [image, duplicate]) == [1, 2]
         assert "sendMediaGroup" in requests[0].full_url
         assert b'filename="file0.jpg"' in requests[0].data
+        clip = vault / "clip.mp4"
+        clip.write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2")
+        requests.clear()
+        with patch.object(
+            kakera, "urlopen",
+            side_effect=lambda request, **_kwargs: (
+                requests.append(request) or TelegramResponse(b'{"ok":true,"result":{"message_id":3}}')
+            ),
+        ):
+            assert kakera.telegram_send("-1", "caption", [clip]) == [3]
+        assert "sendVideo" in requests[0].full_url
+        assert b'name="video"' in requests[0].data
+        requests.clear()
+        with patch.object(
+            kakera, "urlopen",
+            side_effect=lambda request, **_kwargs: (
+                requests.append(request) or TelegramResponse(
+                    b'{"ok":true,"result":[{"message_id":4},{"message_id":5}]}'
+                )
+            ),
+        ):
+            assert kakera.telegram_send("-1", "caption", [image, clip]) == [4, 5]
+        assert b'"type":"photo"' in requests[0].data and b'"type":"video"' in requests[0].data
         for malformed in (
             b'{"ok":true,"result":[]}',
             b'{"ok":true,"result":{"message_id":true}}',
@@ -2595,7 +2761,7 @@ with TemporaryDirectory() as directory:
         transient_url = "https://instagram.com/p/TRANSIENT?foo=bar&igsh=tracking#comments"
         output_roots = {root / "downloads", root / "attachments"}
         observed = []
-        def fake_transient_fetch(_url, _browser, _account, _twitter, directory, name):
+        def fake_transient_fetch(_url, _browser, _account, _twitter, directory, name, include_video=False):
             path = directory / "source.jpg"
             path.write_bytes(b"\xff\xd8\xfftemporary")
             return ({"name": name, "service": "instagram", "url": _url,
@@ -2612,7 +2778,7 @@ with TemporaryDirectory() as directory:
         assert not any(path.exists() for path in output_roots)
         assert not observed[0][1].exists()
         created = []
-        def failing_fetch(_url, _browser, _account, _twitter, directory, name):
+        def failing_fetch(_url, _browser, _account, _twitter, directory, name, include_video=False):
             created.append(Path(directory))
             path = Path(directory) / "source.jpg"
             path.write_bytes(b"\xff\xd8\xfftemporary")
@@ -2624,7 +2790,7 @@ with TemporaryDirectory() as directory:
         assert not success and message == "Telegram delivery uncertain; check the configured chat before retrying"
         assert created and not created[-1].exists()
         created.clear()
-        def exception_fetch(_url, _browser, _account, _twitter, directory, _name):
+        def exception_fetch(_url, _browser, _account, _twitter, directory, _name, include_video=False):
             created.append(Path(directory))
             raise OSError("fetch")
         with patch.object(kakera, "fetch_source", side_effect=exception_fetch):
@@ -2635,7 +2801,7 @@ with TemporaryDirectory() as directory:
             else:
                 raise AssertionError("fetch exception was accepted")
         assert created and not created[-1].exists()
-        with patch.object(kakera, "fetch_source", side_effect=lambda _url, _browser, _account, _twitter, directory, name: (
+        with patch.object(kakera, "fetch_source", side_effect=lambda _url, _browser, _account, _twitter, directory, name, include_video=False: (
                 {"name": name, "service": "instagram", "metadata": {}, "valid": []}, None)):
             success, message = kakera.telegram_only_url(transient_url, None)
         assert not success and "Telegram not sent" in message
@@ -2655,6 +2821,47 @@ with TemporaryDirectory() as directory:
              patch.object(kakera, "telegram_only_url", return_value=(True, "ok")) as allowed:
             assert kakera.main() == 0
         assert allowed.call_args.args[1] == "safari"
+
+        reel_url = "https://www.instagram.com/reel/VIDEOONLY/"
+        def fake_video_fetch(_url, _browser, _account, _twitter, directory, name, include_video=False):
+            assert include_video is True
+            path = Path(directory) / "reel.mp4"
+            path.write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2")
+            return ({"name": name, "service": "instagram", "url": _url,
+                     "metadata": {"title": "Reel", "post_url": _url},
+                     "valid": [(path, ".mp4")]}, None)
+        video_sends = []
+        def observe_video(_chat, caption, files, _token):
+            video_sends.append((files, caption))
+            assert kakera.video_extension(files[0]) == ".mp4"
+            return [11]
+        with patch.object(kakera, "fetch_source", side_effect=fake_video_fetch), \
+             patch.object(kakera, "telegram_send", side_effect=observe_video):
+            success, message = kakera.telegram_only_url(reel_url, None)
+        assert success and message == "Telegram sent 1 video to 123; nothing saved"
+        assert video_sends and "Reel" in video_sends[0][1]
+
+        mixed_url = "https://www.instagram.com/p/MIXED/"
+        def fake_mixed_fetch(_url, _browser, _account, _twitter, directory, name, include_video=False):
+            photo = Path(directory) / "cover.jpg"
+            clip = Path(directory) / "clip.mp4"
+            photo.write_bytes(b"\xff\xd8\xffcover")
+            clip.write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2")
+            return ({"name": name, "service": "instagram", "url": _url,
+                     "metadata": {"title": "Mixed", "post_url": _url},
+                     "valid": [(photo, ".jpg"), (clip, ".mp4")]}, None)
+        mixed_sends = []
+        with patch.object(kakera, "fetch_source", side_effect=fake_mixed_fetch), \
+             patch.object(kakera, "telegram_send", side_effect=lambda *args: (mixed_sends.append(args) or [12, 13])):
+            success, message = kakera.telegram_only_url(mixed_url, None)
+        assert success and message == "Telegram sent 1 image and 1 video to 123; nothing saved"
+        assert [path.suffix for path in mixed_sends[0][2]] == [".jpg", ".mp4"]
+
+        with patch.object(kakera, "fetch_source", return_value=({"valid": [], "metadata": {}}, None)), \
+             patch.object(kakera, "telegram_send") as send:
+            success, message = kakera.telegram_only_url(reel_url, None)
+        assert not success and message == "Telegram not sent: no eligible local images or video"
+        assert not send.called
 
 
 with TemporaryDirectory() as directory:

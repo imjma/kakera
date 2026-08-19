@@ -13,11 +13,11 @@ A user-controlled Obsidian tag on the whole Capture; service tags are generated 
 _Avoid_: Service tag, queue label
 
 **Telegram Delivery**:
-A copy of source images sent by Kakera to its configured Telegram chat, accompanied by a source-derived name and one source URL when available. It may originate from a Capture, a selected Obsidian Note, or a Submitted Source without a Capture.
-_Avoid_: Telegram capture, Telegram source, Telegram post
+A copy of source images sent by Kakera to its configured Telegram chat, accompanied by a source-derived name and one source URL when available. A Transient Telegram Delivery may also include source video; a Delivery from a Capture or an Obsidian Note remains images only.
+_Avoid_: Telegram capture, Telegram source, Telegram post, feed post
 
 **Transient Telegram Delivery**:
-A Telegram Delivery from a Submitted Source that is not retained as a Source Note or Attachments. It is not a Capture and has no Share Receipt. Inbox and Todoist request one with `share/telegram-only`.
+A Telegram Delivery from a Submitted Source that is not retained as a Source Note or Attachments. It may include source video. It is not a Capture and has no Share Receipt. Inbox and Todoist request one with `share/telegram-only`.
 _Avoid_: Capture, memory-only delivery, receipt-free capture
 
 **Share Receipt**:
@@ -69,5 +69,5 @@ The external service associated with a verified Source Post or recognized submit
 _Avoid_: Platform, provider
 
 **Canonical Source URL**:
-The stable form of a Submitted Source URL used to de-duplicate composition inputs and identify repeated runs, with only recognized tracking parameters removed. The original URL remains in the Source Note.
+The stable form of a Submitted Source URL used to de-duplicate composition inputs, identify repeated runs, and write the Source Note and Telegram caption. Recognized tracking parameters and Instagram post query/fragment are removed; the submitted tracking form is not retained.
 _Avoid_: Clean URL, normalized URL

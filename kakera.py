@@ -32,6 +32,7 @@ VERSION = "0.1.0"
 REDDIT_CLIENT_ID = "6N9uN0krSDE-ig"
 TRACKING_PARAMETERS = {
     "igsh",
+    "igsi",
     "ref",
     "ref_source",
     "share_id",
@@ -53,6 +54,8 @@ TELEGRAM_TAG = "share/telegram"
 TELEGRAM_ONLY_TAG = "share/telegram-only"
 TELEGRAM_MAX_IMAGES = 10
 TELEGRAM_MAX_BYTES = 10 * 1024 * 1024
+TELEGRAM_MAX_VIDEO_BYTES = 50 * 1024 * 1024
+IMAGE_FTYP_BRANDS = {b"avif", b"avis", b"heic", b"heix", b"hevc", b"hevx", b"mif1"}
 
 
 def tag_character_allowed(character: str) -> bool:
@@ -183,9 +186,26 @@ def normalize_instagram_post_url(url: str) -> str:
     if (parts.hostname or "").lower() not in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
         return url
     segments = [segment for segment in parts.path.split("/") if segment]
-    if len(segments) < 2 or segments[0] not in {"p", "reel", "tv"}:
+    shape = "reel" if segments and segments[0] == "reels" else (segments[0] if segments else "")
+    if len(segments) < 2 or shape not in {"p", "reel", "tv"}:
         return url
-    return urlunsplit((parts.scheme, parts.netloc, f"/{segments[0]}/{segments[1]}/", "", ""))
+    return urlunsplit((parts.scheme, parts.netloc, f"/{shape}/{segments[1]}/", "", ""))
+
+
+def published_url(url: str) -> str:
+    """URL stored on a Source Note and sent in a Telegram caption."""
+    url = normalize_instagram_post_url(url)
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    segments = [segment for segment in parts.path.split("/") if segment]
+    shape = "reel" if segments and segments[0] == "reels" else (segments[0] if segments else "")
+    if host in {"instagram.com", "www.instagram.com", "m.instagram.com"} and (
+            len(segments) >= 2 and shape in {"p", "reel", "tv"}):
+        return url
+    query = urlencode(
+        [(key, value) for key, value in parse_qsl(parts.query) if key not in TRACKING_PARAMETERS]
+    )
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, ""))
 
 
 def dedupe_urls(urls: list[str]) -> list[str]:
@@ -211,7 +231,7 @@ def capture_id(url: str) -> str:
 
     if host in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
         service = "instagram"
-        if len(segments) >= 2 and segments[0] in {"p", "reel", "tv"}:
+        if len(segments) >= 2 and segments[0] in {"p", "reel", "reels", "tv"}:
             post_id = segments[1]
         if not post_id:
             raise ValueError("Instagram URL must be an individual post")
@@ -753,11 +773,21 @@ def image_extension(path: Path) -> str | None:
         return ".webp"
     if data[:4] in {b"II*\x00", b"MM\x00*"}:
         return ".tiff"
-    if data[4:8] == b"ftyp" and data[8:12] in {b"avif", b"avis"}:
-        return ".avif"
-    if data[4:8] == b"ftyp" and data[8:12] in {b"heic", b"heix", b"hevc", b"hevx", b"mif1"}:
-        return ".heic"
+    if data[4:8] == b"ftyp" and data[8:12] in IMAGE_FTYP_BRANDS:
+        return ".avif" if data[8:12] in {b"avif", b"avis"} else ".heic"
     return None
+
+
+def video_extension(path: Path) -> str | None:
+    with path.open("rb") as file:
+        data = file.read(16)
+    if len(data) >= 12 and data[4:8] == b"ftyp" and data[8:12] not in IMAGE_FTYP_BRANDS:
+        return ".mp4"
+    return None
+
+
+def media_extension(path: Path, *, allow_video: bool = False) -> str | None:
+    return image_extension(path) or (video_extension(path) if allow_video else None)
 
 
 def digest(path: Path) -> str:
@@ -837,7 +867,51 @@ def canonical_lock_path(path: Path) -> str:
     return "/".join(unicodedata.normalize("NFD", part).casefold() for part in resolved.parts)
 
 
-def parse_rednote(page: str, source: str) -> tuple[str, dict, list[str]]:
+def _rednote_https(url: object) -> str | None:
+    if isinstance(url, str) and url.startswith(("http://", "https://")):
+        return url.replace("http://", "https://", 1)
+    return None
+
+
+def _rednote_video_url(note: dict) -> str | None:
+    video = note.get("video")
+    if not isinstance(video, dict):
+        return None
+    media = video.get("media")
+    stream = media.get("stream") if isinstance(media, dict) else None
+    if isinstance(stream, dict):
+        for codec in ("h264", "h265", "h266", "hevc", "av1"):
+            items = stream.get(codec)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                for key in ("masterUrl", "url"):
+                    found = _rednote_https(item.get(key))
+                    if found:
+                        return found
+                backups = item.get("backupUrls")
+                if isinstance(backups, list):
+                    for backup in backups:
+                        found = _rednote_https(backup)
+                        if found:
+                            return found
+    found = _rednote_https(video.get("url"))
+    if found:
+        return found
+    consumer = media.get("consumer") if isinstance(media, dict) else None
+    key = None
+    if isinstance(consumer, dict):
+        key = consumer.get("originVideoKey")
+    if not key and isinstance(media, dict):
+        key = media.get("originVideoKey")
+    if isinstance(key, str) and key and not key.startswith(("http://", "https://")):
+        return f"https://sns-video-bd.xhscdn.com/{key.lstrip('/')}"
+    return _rednote_https(key)
+
+
+def parse_rednote(page: str, source: str) -> tuple[str, dict, list[str], str | None]:
     match = re.search(r"window\.__INITIAL_STATE__=(.*?)</script>", page, re.S)
     if not match:
         raise ValueError("RedNote page did not include public note data")
@@ -857,7 +931,8 @@ def parse_rednote(page: str, source: str) -> tuple[str, dict, list[str]]:
         for image in note.get("imageList", [])
     ]
     images = [url.replace("http://", "https://", 1) for url in images if url]
-    if not images:
+    video = _rednote_video_url(note)
+    if not images and not video:
         raise ValueError("RedNote note has no public images")
 
     user = note.get("user") or {}
@@ -878,7 +953,7 @@ def parse_rednote(page: str, source: str) -> tuple[str, dict, list[str]]:
     }
     if not isinstance(note_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", note_id):
         note_id = hashlib.sha256(canonical_url(source).encode()).hexdigest()[:12]
-    return f"rednote-{note_id}", metadata, images
+    return f"rednote-{note_id}", metadata, images, video
 
 
 def rednote_fetch_url(url: str) -> str:
@@ -888,7 +963,15 @@ def rednote_fetch_url(url: str) -> str:
     return url
 
 
-def download_rednote(url: str, directory: Path) -> tuple[str, dict]:
+def _rednote_fetch_bytes(url: str, headers: dict, limit: int, label: str) -> bytes:
+    with urlopen(Request(url, headers=headers), timeout=30) as response:
+        data = response.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f"RedNote {label} exceeds 50 MB")
+    return data
+
+
+def download_rednote(url: str, directory: Path, include_video: bool = False) -> tuple[str, dict]:
     headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) Kakera/0.1"}
     try:
         with urlopen(Request(rednote_fetch_url(url), headers=headers), timeout=30) as response:
@@ -896,14 +979,16 @@ def download_rednote(url: str, directory: Path) -> tuple[str, dict]:
             final_url = response.url
         if len(page) > 5 * 1024 * 1024:
             raise ValueError("RedNote page is unexpectedly large")
-        name, metadata, images = parse_rednote(page.decode("utf-8"), url)
+        name, metadata, images, video = parse_rednote(page.decode("utf-8"), url)
+        if not images and not (include_video and video):
+            raise ValueError("RedNote note has no public images")
+        file_headers = {**headers, "Referer": final_url}
         for index, image_url in enumerate(images, 1):
-            request = Request(image_url, headers={**headers, "Referer": final_url})
-            with urlopen(request, timeout=30) as response:
-                data = response.read(50 * 1024 * 1024 + 1)
-            if len(data) > 50 * 1024 * 1024:
-                raise ValueError("RedNote image exceeds 50 MB")
+            data = _rednote_fetch_bytes(image_url, file_headers, 50 * 1024 * 1024, "image")
             (directory / f"{index:02}.image").write_bytes(data)
+        if include_video and video:
+            data = _rednote_fetch_bytes(video, file_headers, 50 * 1024 * 1024, "video")
+            (directory / f"{len(images) + 1:02}.video").write_bytes(data)
         return name, metadata
     except OSError as error:
         raise ValueError(f"RedNote request failed: {error}") from error
@@ -1123,6 +1208,8 @@ def write_note(
     post_url = metadata.get("post_url") or (
         f"https://www.reddit.com{metadata['permalink']}" if metadata.get("permalink") else source
     )
+    if isinstance(post_url, str):
+        post_url = published_url(post_url)
     link_property = "xhslink" if service == "rednote" else service
 
     properties = [
@@ -1192,12 +1279,12 @@ def _normalise_source_metadata(name: str, service: str, metadata: dict, url: str
             "post_url": url,
             "_capture_post_id": name.split("-", 1)[1],
         }
-    return metadata
+    return {**metadata, "post_url": url}
 
 
 def _source_fields(source: dict) -> list[tuple[str, str]]:
     metadata, service, url = source["metadata"], source["service"], source["url"]
-    fields = [("URL", metadata.get("post_url") or url), ("Title", note_title(metadata, service))]
+    fields = [("URL", published_url(metadata.get("post_url") or url)), ("Title", note_title(metadata, service))]
     username = metadata.get("username") or metadata.get("author")
     author = metadata.get("author") if service == "twitter" else metadata.get("fullname") or username
     author_url = metadata.get("author_url")
@@ -1240,7 +1327,7 @@ def write_composed_note(note: Path, sources: list[dict], tags: list[str]) -> Non
         link_property = "xhslink" if service == "rednote" else service
     else:
         link_property = "source"
-    properties.append(f"{link_property}: {json.dumps(primary['url'], ensure_ascii=False)}")
+    properties.append(f"{link_property}: {json.dumps(published_url(primary['url']), ensure_ascii=False)}")
     if primary_ok:
         username = metadata.get("username") or metadata.get("author")
         author = metadata.get("author") if service == "twitter" else metadata.get("fullname") or username
@@ -1274,12 +1361,12 @@ def write_composed_note(note: Path, sources: list[dict], tags: list[str]) -> Non
         body.append("\n\n".join(primary_body))
     else:
         label = "Unknown" if primary["service"] == "unknown" else "Failed"
-        body.append(f"## Source 1 — {label}\n- URL: {primary['url']}\n- Failure: {primary['error']}")
+        body.append(f"## Source 1 — {label}\n- URL: {published_url(primary['url'])}\n- Failure: {primary['error']}")
     for index, source in enumerate(sources[1:], 2):
         heading = source["service"].title() if source["service"] != "rednote" else "小红书"
         section = [f"## Source {index} — {heading}"]
         if source.get("error") and not source.get("images"):
-            section.extend((f"- URL: {source['url']}", f"- Failure: {source['error']}"))
+            section.extend((f"- URL: {published_url(source['url'])}", f"- Failure: {source['error']}"))
         else:
             section.extend(f"- {key}: {value}" for key, value in _source_fields(source))
             description = _source_description(source["metadata"], source["service"])
@@ -1542,7 +1629,7 @@ def _telegram_note_caption(note: Path, text: str, selected_url: str | None = Non
         url = next((match.group(0).rstrip(".,!?;:)]}") for match in HTTP_URL.finditer(body)
                     if not _telegram_image_url(match.group(0))), None)
     return _telegram_caption_text(
-        note.stem, normalize_instagram_post_url(url) if url else url, note.name
+        note.stem, published_url(url) if url else url, note.name
     )
 
 
@@ -1555,17 +1642,45 @@ def _telegram_caption_text(stem: str, url: str | None, label: str = "note") -> s
     return stem[:1024]
 
 
-def _telegram_filter_images(paths: list[Path]) -> list[Path]:
+def _telegram_file_kind(path: Path) -> str | None:
+    if image_extension(path):
+        return "photo"
+    if video_extension(path):
+        return "video"
+    return None
+
+
+def _telegram_file_extension(path: Path) -> str:
+    return image_extension(path) or video_extension(path) or ".bin"
+
+
+def _telegram_count_label(paths: list[Path]) -> str:
+    images = sum(1 for path in paths if image_extension(path))
+    videos = sum(1 for path in paths if video_extension(path))
+    parts = []
+    if images:
+        parts.append(f"{images} image" if images == 1 else f"{images} images")
+    if videos:
+        parts.append(f"{videos} video" if videos == 1 else f"{videos} videos")
+    return " and ".join(parts) if parts else "0 images"
+
+
+def _telegram_filter_images(paths: list[Path], *, allow_video: bool = False) -> list[Path]:
     result, seen = [], set()
-    oversized = overflow = 0
+    oversized_images = oversized_videos = overflow = 0
     for path in paths:
         try:
             path = path.resolve()
-            if not path.is_file() or path in seen or not image_extension(path):
+            if not path.is_file() or path in seen or not media_extension(path, allow_video=allow_video):
                 continue
             seen.add(path)
-            if path.stat().st_size > TELEGRAM_MAX_BYTES:
-                oversized += 1
+            video = bool(video_extension(path))
+            limit = TELEGRAM_MAX_VIDEO_BYTES if video else TELEGRAM_MAX_BYTES
+            if path.stat().st_size > limit:
+                if video:
+                    oversized_videos += 1
+                else:
+                    oversized_images += 1
                 continue
             if len(result) >= TELEGRAM_MAX_IMAGES:
                 overflow += 1
@@ -1573,10 +1688,13 @@ def _telegram_filter_images(paths: list[Path]) -> list[Path]:
             result.append(path)
         except OSError:
             continue
-    if oversized:
-        print(f"warning: skipped {oversized} Telegram image(s) over 10 MB", file=sys.stderr)
+    if oversized_images:
+        print(f"warning: skipped {oversized_images} Telegram image(s) over 10 MB", file=sys.stderr)
+    if oversized_videos:
+        print(f"warning: skipped {oversized_videos} Telegram video(s) over 50 MB", file=sys.stderr)
     if overflow:
-        print(f"warning: skipped {overflow} eligible Telegram image(s) after the first 10", file=sys.stderr)
+        kind = "image(s) or video" if allow_video else "image(s)"
+        print(f"warning: skipped {overflow} eligible Telegram {kind} after the first 10", file=sys.stderr)
     return result
 
 
@@ -1591,12 +1709,22 @@ def _telegram_multipart(method: str, chat_id: str, caption: str, images: list[Pa
         path = images[0]
         data = path.read_bytes()
         chunks.extend((f"--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"photo{image_extension(path) or '.bin'}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode(), data, b"\r\n"))
+    elif method == "sendVideo":
+        field("caption", caption)
+        path = images[0]
+        data = path.read_bytes()
+        chunks.extend((f"--{boundary}\r\nContent-Disposition: form-data; name=\"video\"; filename=\"video{_telegram_file_extension(path)}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode(), data, b"\r\n"))
     else:
-        media = [{"type": "photo", "media": f"attach://file{i}", **({"caption": caption} if i == 0 else {})}
-                 for i in range(len(images))]
+        media = []
+        for i, path in enumerate(images):
+            kind = _telegram_file_kind(path) or "photo"
+            item = {"type": kind, "media": f"attach://file{i}"}
+            if i == 0:
+                item["caption"] = caption
+            media.append(item)
         field("media", json.dumps(media, separators=(",", ":")))
         for i, path in enumerate(images):
-            chunks.extend((f"--{boundary}\r\nContent-Disposition: form-data; name=\"file{i}\"; filename=\"file{i}{image_extension(path) or '.bin'}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode(), path.read_bytes(), b"\r\n"))
+            chunks.extend((f"--{boundary}\r\nContent-Disposition: form-data; name=\"file{i}\"; filename=\"file{i}{_telegram_file_extension(path)}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode(), path.read_bytes(), b"\r\n"))
     chunks.append(f"--{boundary}--\r\n".encode())
     return b"".join(chunks), boundary
 
@@ -1604,15 +1732,19 @@ def _telegram_multipart(method: str, chat_id: str, caption: str, images: list[Pa
 def telegram_send(chat_id: str, caption: str, images: list[Path], token: str | None = None) -> list[int]:
     if not 1 <= len(images) <= TELEGRAM_MAX_IMAGES:
         raise ValueError("Telegram delivery requires 1 to 10 images")
-    method = "sendPhoto" if len(images) == 1 else "sendMediaGroup"
+    if len(images) == 1:
+        method = "sendVideo" if video_extension(images[0]) else "sendPhoto"
+    else:
+        method = "sendMediaGroup"
     body, boundary = _telegram_multipart(method, chat_id, caption, images)
     token = token or telegram_token()
+    timeout = 120 if any(video_extension(path) for path in images) else 30
     request = Request(
         f"{TELEGRAM_API}/bot{token}/{method}", data=body,
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}, method="POST",
     )
     try:
-        with urlopen(request, timeout=30) as response:
+        with urlopen(request, timeout=timeout) as response:
             if getattr(response, "status", 200) >= 400:
                 raise OSError("Telegram HTTP error")
             payload = json.loads(response.read() or b"{}")
@@ -1808,7 +1940,7 @@ def telegram_note_only_command(selectors: list[str]) -> int:
 
 def telegram_only_url(url: str, browser: str | None, account: str | None = None,
                       twitter_account: str | None = None) -> tuple[bool, str]:
-    """Fetch one URL to a temporary directory and publish its images without saving."""
+    """Fetch one URL to a temporary directory and publish it without saving."""
     chat_id = configured_telegram_chat_id()
     token = telegram_token()
     try:
@@ -1817,7 +1949,7 @@ def telegram_only_url(url: str, browser: str | None, account: str | None = None,
         return False, f"Telegram not sent: {error}"
     with tempfile.TemporaryDirectory(prefix="kakera-telegram-") as directory:
         source, error = fetch_source(url, browser, account, twitter_account,
-                                     Path(directory), name)
+                                     Path(directory), name, include_video=True)
         source_error = error or (source.get("error") if isinstance(source, dict) else None)
         if source_error or not source:
             return False, f"Telegram not sent: {source_error or 'source fetch failed'}"
@@ -1829,19 +1961,20 @@ def telegram_only_url(url: str, browser: str | None, account: str | None = None,
                     candidates.append(path)
             except OSError:
                 pass
-        images = _telegram_filter_images(candidates)
-        if not images:
-            return False, "Telegram not sent: no eligible local images"
+        files = _telegram_filter_images(candidates, allow_video=True)
+        if not files:
+            return False, "Telegram not sent: no eligible local images or video"
         metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
         stem = note_filename(metadata, source.get("service", "unknown"))
         caption = _telegram_caption_text(
-            stem, normalize_instagram_post_url(source.get("url", url)), url
+            stem, published_url(source.get("url") or url), url
         )
         try:
-            message_ids = telegram_send(chat_id, caption, images, token)
-        except ValueError as send_error:
+            telegram_send(chat_id, caption, files, token)
+        except ValueError:
             return False, "Telegram delivery uncertain; check the configured chat before retrying"
-    return True, f"Telegram sent {len(message_ids)} image(s) to {chat_id}; nothing saved"
+        label = _telegram_count_label(files)
+    return True, f"Telegram sent {label} to {chat_id}; nothing saved"
 
 
 def telegram_requested(tags: list[str] | None) -> bool:
@@ -1931,6 +2064,7 @@ def fetch_source(
     twitter_account: str | None,
     directory: Path,
     name: str | None = None,
+    include_video: bool = False,
 ) -> tuple[dict | None, str | None]:
     directory.mkdir(parents=True, exist_ok=True)
     try:
@@ -1942,7 +2076,7 @@ def fetch_source(
     result = None
     if name.startswith("rednote-"):
         try:
-            name, metadata = download_rednote(url, directory)
+            name, metadata = download_rednote(url, directory, include_video=include_video)
         except ValueError as error:
             return None, str(error)
     else:
@@ -1972,8 +2106,10 @@ def fetch_source(
             if reddit:
                 command.extend(("-o", f"extractor.reddit.client-id={reddit[0]}",
                                 "-o", f"extractor.reddit.user-agent={reddit[1]}"))
-        if name.startswith("twitter-"):
-            command.extend(("-o", "extractor.twitter.videos=false"))
+        if not include_video:
+            service = name.split("-", 1)[0]
+            if service in {"instagram", "twitter", "reddit"}:
+                command.extend(("-o", f"extractor.{service}.videos=false"))
         command.append(normalized_url)
         result = subprocess.run(command, capture_output=True, text=True)
     if result and result.returncode:
@@ -2005,22 +2141,37 @@ def fetch_source(
         except OSError:
             return None
 
-    candidates = [contained_file(path) for path in directory.rglob("*")]
-    candidates = [path for path in candidates if path is not None]
-    printed = []
-    if result and result.stdout:
-        for line in result.stdout.splitlines():
-            candidate = Path(line.strip())
-            if not candidate.is_absolute():
-                candidate = directory / candidate
-            candidate = contained_file(candidate)
-            if candidate is not None and candidate not in printed:
-                printed.append(candidate)
-    candidates = printed + [path for path in candidates if path not in printed]
-    valid = [(path, image_extension(path)) for path in candidates]
-    valid = [(path, extension) for path, extension in valid if extension]
+    if name.startswith("rednote-"):
+        candidates = []
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            entries = []
+        for path in sorted(entries, key=lambda item: item.name):
+            candidate = contained_file(path)
+            if candidate is not None:
+                candidates.append(candidate)
+    else:
+        candidates = [contained_file(path) for path in directory.rglob("*")]
+        candidates = [path for path in candidates if path is not None]
+        printed = []
+        if result and result.stdout:
+            for line in result.stdout.splitlines():
+                candidate = Path(line.strip())
+                if not candidate.is_absolute():
+                    candidate = directory / candidate
+                candidate = contained_file(candidate)
+                if candidate is not None and candidate not in printed:
+                    printed.append(candidate)
+        candidates = printed + [path for path in candidates if path not in printed]
+    valid = []
+    for path in candidates:
+        extension = media_extension(path, allow_video=include_video)
+        if extension:
+            valid.append((path, extension))
     if not valid:
-        return None, "no supported images found"
+        return None, ("no supported images or video found" if include_video
+                      else "no supported images found")
     if not metadata:
         sidecars = [path.with_suffix(path.suffix + ".json") for path, _ in valid]
         sidecars = [contained_file(path) for path in sidecars]
@@ -2035,8 +2186,9 @@ def fetch_source(
             except (OSError, json.JSONDecodeError):
                 pass
     service = name.split("-", 1)[0]
-    metadata = _normalise_source_metadata(name, service, metadata, normalized_url)
-    return {"name": name, "service": service, "url": normalized_url,
+    published = published_url(normalized_url)
+    metadata = _normalise_source_metadata(name, service, metadata, published)
+    return {"name": name, "service": service, "url": published,
             "metadata": metadata, "valid": valid}, None
 
 

@@ -398,7 +398,9 @@ vault or, for `local --telegram`, Kakera's local output roots. Remote URLs,
 `data:` URLs, missing files, non-images, escaping paths, and ambiguous bare
 image names are not fetched or sent. Files over 10 MB are skipped, and the
 first ten eligible images are sent. A single image uses `sendPhoto`; two
-through ten use `sendMediaGroup`.
+through ten use `sendMediaGroup`. Transient URL delivery also accepts MP4
+video (50 MB limit): one video uses `sendVideo`; mixed photos and videos use
+`sendMediaGroup` in source order.
 
 The caption contains only the actual note filename stem on line one for an
 existing note, or the prospective Source Note name derived from fetched
@@ -429,19 +431,22 @@ capture, queue, account, cookie, or OAuth options.
 
 `kakera --telegram-only URL...` validates the Telegram configuration and token,
 fetches each URL completely into one private temporary directory, and sends the
-first ten eligible local images. It creates no note, attachment, output folder,
-tag, queue state, or receipt; temporary files exist briefly on disk and can
-remain after a crash. A partial or failed fetch is never sent. Each URL is an
-independent post, and a transport timeout is reported as uncertain: inspect the
-Telegram target before retrying.
+first ten eligible local images and MP4 videos, in source order. It creates no
+note, attachment, output folder, tag, queue state, or receipt; temporary files
+exist briefly on disk and can remain after a crash. A partial or failed fetch is
+never sent. Each URL is an independent post, and a transport timeout is reported
+as uncertain: inspect the Telegram target before retrying.
 
 For this command, `--browser`, `--account`, and `--twitter-account` are the only
 source-auth options. Capture/composition flags, explicit output folders, tags,
 Inbox/Todoist/`--watch`, cookie exports, and OAuth are rejected. It must not be
 used as a fallback for either note-publishing command.
 
-These no-storage modes do not compose sources, process Inbox/Todoist/watch,
-publish videos, or fetch remote images embedded in an existing note.
+`--telegram-only` / queue `share/telegram-only` can publish MP4 video from
+Instagram, Twitter/X, Reddit, and RedNote. Capture, `share/telegram`, and
+note-publishing commands stay image-only and do not download video. These
+no-storage modes do not compose sources, process Inbox/Todoist/watch, or fetch
+remote images embedded in an existing note.
 
 #### Telegram troubleshooting
 
@@ -452,7 +457,7 @@ publish videos, or fetch remote images embedded in an existing note.
 | Bot cannot send | Recheck channel **Post Messages** or group send-message/send-photo permissions. |
 | `getUpdates` is empty | Send a fresh group/channel event; check whether another consumer or webhook has consumed updates. |
 | Existing-note has no eligible images | Check Markdown/Obsidian embed paths, image type, vault containment, and the 10 MB limit. Remote, data, missing, ambiguous, and outside-vault images are omitted. |
-| Transient URL has no eligible images | Check that the complete fetch produced supported local images; partial/failed fetches are never sent. |
+| Transient URL has no eligible images or video | Check that the complete fetch produced supported local images or an MP4; partial/failed fetches are never sent. WebM and other non-MP4 video is ignored. |
 | Ambiguous note or image | Use the listed relative note path or a qualified embed/path. |
 | Telegram timeout/API failure | First inspect the target in Telegram to see whether the images arrived; only retry when delivery is confirmed absent or a retry is appropriate, because acknowledgement may have been lost after Telegram accepted the send. |
 | Telegram sent but receipt update failed | Inspect the note for concurrent edits or filesystem/provider write errors; resend only after confirming Telegram state. |
@@ -588,10 +593,10 @@ non-service/manual tags and adding current queue or CLI tags.
 
 | Service | Accepted URL examples | Capture behavior |
 | --- | --- | --- |
-| Instagram | `https://www.instagram.com/p/ID/`, `/reel/ID/`, `/tv/ID/` | Uses gallery-dl; login cookies may be required. |
-| Twitter/X | `https://x.com/USER/status/ID`, `https://x.com/i/web/status/ID`, `twitter.com/.../status/ID`, optional `/photo/N` or `/video/N` | Individual status only; images are saved and videos are ignored. |
-| Reddit | `https://redd.it/ID`, Reddit `/comments/ID/` or `/gallery/ID/` URLs | Uses gallery-dl; configure Reddit OAuth when required. |
-| RedNote | `http(s)://xhslink.com/m/ID` or `/o/ID`, public `xiaohongshu.com/explore/ID` or `/item/ID` | Reads public page data and images; no login-only posts. |
+| Instagram | `https://www.instagram.com/p/ID/`, `/reel/ID/`, `/reels/ID/`, `/tv/ID/` | Uses gallery-dl; login cookies may be required. `/reels/` is the same post as `/reel/`. Capture keeps images only. Transient Telegram Delivery can send MP4 video. |
+| Twitter/X | `https://x.com/USER/status/ID`, `https://x.com/i/web/status/ID`, `twitter.com/.../status/ID`, optional `/photo/N` or `/video/N` | Individual status only; Capture saves images and ignores videos. Transient Telegram Delivery can send MP4 video. |
+| Reddit | `https://redd.it/ID`, Reddit `/comments/ID/` or `/gallery/ID/` URLs | Uses gallery-dl; configure Reddit OAuth when required. Capture keeps images only. Transient Telegram Delivery can send MP4 video. |
+| RedNote | `http(s)://xhslink.com/m/ID` or `/o/ID`, public `xiaohongshu.com/explore/ID` or `/item/ID` | Reads public page data and images; no login-only posts. Capture does not download video; Transient Telegram Delivery sends covers then the MP4. |
 
 ## Output
 
@@ -630,13 +635,15 @@ post ID and service in the filename, for example
   change, rate-limit, or require a current logged-in browser session.
 - Twitter/X accepts individual status URLs and saves images only. Text-only,
   video-only, and image-free posts return `no supported images found`; videos
-  in mixed posts are ignored.
+  in mixed posts are ignored on Capture. `--telegram-only` can send the MP4.
 - RedNote is limited to public page data and has a 5 MB page and 50 MB per-image
-  limit. Gallery-dl captures are limited to 50 MB per file.
+  or per-video limit. Gallery-dl captures are limited to 50 MB per file.
+  Capture does not download RedNote video; Transient Telegram Delivery does.
 - Kakera does not bypass login walls, CAPTCHAs, private-post restrictions, or
   access controls, and native iOS/macOS apps are not part of v0.1.0.
 - Kakera processes only URLs you provide. For an explicitly requested Telegram
-  delivery, it sends the selected image bytes, the actual note stem (or a
+  delivery, it sends the selected image bytes and, for Transient Telegram
+  Delivery, MP4 video, the actual note stem (or a
   transient source-derived prospective name), and optional source URL to
   `api.telegram.org`; it does not send source text, tags, browser cookies, or
   service account tokens as Telegram message content.
