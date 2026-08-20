@@ -103,7 +103,15 @@ capture in an invocation, including watch mode. Hashtags typed in task text
 are not parsed as labels. The `share/telegram-only` label (or `--tag
 share/telegram-only`) requests a Transient Telegram Delivery instead of a
 Capture: each URL is sent independently, nothing is stored, and the root task
-closes only when every URL delivers. See the README's [shared Capture Tag rules][tags]
+closes only when every URL delivers.
+
+```sh
+./kakera todoist --tag share/telegram-only
+./kakera todoist --tag share/telegram-only --watch
+```
+
+The same Transient Telegram Delivery from a URL on the command line is
+`./kakera --share telegram-only URL`. See the README's [shared Capture Tag rules][tags]
 for normalization, duplicate handling, and merge order.
 
 ## Troubleshooting

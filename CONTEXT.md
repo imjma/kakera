@@ -17,7 +17,7 @@ A copy of source images sent by Kakera to its configured Telegram chat, accompan
 _Avoid_: Telegram capture, Telegram source, Telegram post, feed post
 
 **Transient Telegram Delivery**:
-A Telegram Delivery from a Submitted Source that is not retained as a Source Note or Attachments. It may include source video. It is not a Capture and has no Share Receipt. Inbox and Todoist request one with `share/telegram-only`.
+A Telegram Delivery from a Submitted Source that is not retained as a Source Note or Attachments. It may include source video. It is not a Capture and has no Share Receipt. Inbox and Todoist request one with `share/telegram-only`. Telegram Intake requests one for each recognized Source Service URL.
 _Avoid_: Capture, memory-only delivery, receipt-free capture
 
 **Share Receipt**:
@@ -63,6 +63,10 @@ _Avoid_: Queue database, link file, Todoist
 **Todoist**:
 An external project of open tasks whose URLs are waiting to become Captures, or Transient Telegram Deliveries when requested with `share/telegram-only`, the same role as the Inbox. A parent task and nested subtasks may form one ordered composition; native labels become Capture Tags except `share/telegram-only`, which is a queue request and is not persisted.
 _Avoid_: Inbox, queue label
+
+**Telegram Intake**:
+Private Telegram messages to the bot from allowed users. A recognized Source Service URL in the message text or caption is a Submitted Source for a Transient Telegram Delivery to the configured chat. Only a new private message is a submission; an edit of a consumed message is not. Each consumed message is finished; it is not left pending and is not retried. Success is the Delivery in the configured chat; that Delivery names the sender by Telegram username, or display name when they have no username, not by user ID. A failed Delivery is reported in the private chat.
+_Avoid_: telegram-bot, Telegram Inbox, Telegram queue, Telegram post
 
 **Source Service**:
 The external service associated with a verified Source Post or recognized submitted source. Kakera v0.1 supports Instagram, Twitter (x.com), Reddit, and public RedNote posts.

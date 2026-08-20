@@ -2284,6 +2284,16 @@ with TemporaryDirectory() as directory:
                 assert "secret" not in str(error)
             else:
                 raise AssertionError("Telegram transport failure was accepted")
+        with patch.object(
+            kakera, "urlopen",
+            return_value=TelegramResponse(b'{"ok":false,"description":"Bad Request: chat not found"}'),
+        ):
+            try:
+                kakera.telegram_send("-1", "caption", [image])
+            except ValueError as error:
+                assert str(error) == "Telegram request failed: Bad Request: chat not found"
+            else:
+                raise AssertionError("accepted Telegram chat-not-found")
 
         resend = notes / "resend.md"
         resend.write_text('---\nkakera: {"shared":{"telegram":{"-1":[3]}}}\n---\n![](../photo.jpg)\n')
@@ -2339,10 +2349,12 @@ with TemporaryDirectory() as directory:
             assert error.code == 0
     help_text = " ".join(help_output.getvalue().split())
     for phrase in (
-        "kakera --telegram URL [URL ...]",
-        "kakera telegram SELECTOR [SELECTOR ...]",
-        "telegram-only SELECTOR [SELECTOR ...]",
-        "kakera --telegram-only URL [URL ...]",
+        "kakera --share telegram URL [URL ...]",
+        "kakera --compose --share telegram URL [URL ...]",
+        "kakera share telegram SELECTOR [SELECTOR ...]",
+        "share telegram-only SELECTOR [SELECTOR ...]",
+        "kakera --share telegram-only URL [URL ...]",
+        "kakera telegram [--watch]",
         "--tag share/telegram",
         "save the Capture first",
         "no durable Kakera output",
@@ -2352,7 +2364,7 @@ with TemporaryDirectory() as directory:
     with (
         patch.object(kakera, "configured_folders", return_value=(notes, attachments)),
         patch.object(kakera, "save", return_value=(True, "saved")) as save,
-        patch.object(kakera.sys, "argv", ["kakera.py", "--telegram", "one"]),
+        patch.object(kakera.sys, "argv", ["kakera.py", "--share", "telegram", "one"]),
     ):
         assert kakera.main() == 0
     assert save.call_args.args[-1] == ["share/telegram"]
@@ -2360,7 +2372,7 @@ with TemporaryDirectory() as directory:
     with (
         patch.object(kakera, "configured_folders", side_effect=AssertionError("local used config")),
         patch.object(kakera, "save", return_value=(True, "saved")) as save,
-        patch.object(kakera.sys, "argv", ["kakera.py", "--local", "--telegram", "one"]),
+        patch.object(kakera.sys, "argv", ["kakera.py", "--local", "--share", "telegram", "one"]),
     ):
         assert kakera.main() == 0
     assert save.call_args.args[2:4] == (kakera.ROOT / "downloads", kakera.ROOT / "attachments")
@@ -2372,7 +2384,7 @@ with TemporaryDirectory() as directory:
             assert kakera.main() == 0
         (note_command if flag == "--telegram-note" else note_only_command).assert_called_once_with([selector])
 
-    with patch.object(kakera.sys, "argv", ["kakera.py", "--telegram-only"]), \
+    with patch.object(kakera.sys, "argv", ["kakera.py", "--share", "telegram-only"]), \
          patch.object(kakera, "configured_telegram_chat_id", side_effect=AssertionError("config before URL")), \
          patch.object(kakera, "telegram_token", side_effect=AssertionError("token before URL")):
         try:
@@ -2380,7 +2392,7 @@ with TemporaryDirectory() as directory:
         except SystemExit as error:
             assert error.code == 2
         else:
-            raise AssertionError("accepted --telegram-only without a URL")
+            raise AssertionError("accepted --share telegram-only without a URL")
 
     queue = root / "inbox.md"
     queue.write_text("- [ ] https://x.com/a/status/queue\n")
@@ -2423,13 +2435,15 @@ with TemporaryDirectory() as directory:
     assert "[ ]" in partial_queue.read_text()
 
     for argv, function_name in (
-        (["kakera.py", "--telegram", "--instagram-cookies", "x"], "instagram_cookies"),
-        (["kakera.py", "--telegram", "--reddit-oauth", "x"], "reddit_oauth"),
+        (["kakera.py", "--share", "telegram", "--instagram-cookies", "x"], "instagram_cookies"),
+        (["kakera.py", "--share", "telegram", "--reddit-oauth", "x"], "reddit_oauth"),
         (["kakera.py", "--telegram-note", "--watch", "Note.md"], "telegram_command"),
         (["kakera.py", "--telegram-note", "--interval", "3m", "Note.md"], "telegram_command"),
-        (["kakera.py", "--telegram-only", "--compose", "https://example.test/x"], "telegram_only_url"),
-        (["kakera.py", "--telegram-only", "--interval", "3m", "https://example.test/x"], "telegram_only_url"),
+        (["kakera.py", "--share", "telegram-only", "--compose", "https://example.test/x"], "telegram_only_url"),
+        (["kakera.py", "--share", "telegram-only", "--interval", "3m", "https://example.test/x"], "telegram_only_url"),
         (["kakera.py", "--tag", "share/telegram-only", "https://x.com/a/status/1"], "save"),
+        (["kakera.py", "--telegram-intake", "--interval", "30s", "--watch"], "telegram_intake"),
+        (["kakera.py", "--telegram-intake", "https://x.com/a/status/1"], "telegram_intake"),
     ):
         with patch.object(kakera.sys, "argv", argv), patch.object(kakera, function_name) as called:
             try:
@@ -2775,6 +2789,10 @@ with TemporaryDirectory() as directory:
             success, message = kakera.telegram_only_url(transient_url, None)
         assert success and "nothing saved" in message and observed and observed[0][0]
         assert observed[0][2].endswith("\nhttps://instagram.com/p/TRANSIENT/")
+        with patch.object(kakera, "fetch_source", side_effect=fake_transient_fetch), \
+             patch.object(kakera, "telegram_send", side_effect=observe_send):
+            success, message = kakera.telegram_only_url(transient_url, None, sender="@imjma")
+        assert success and observed[-1][2].endswith("\nhttps://instagram.com/p/TRANSIENT/\nfrom @imjma")
         assert not any(path.exists() for path in output_roots)
         assert not observed[0][1].exists()
         created = []
@@ -2788,6 +2806,11 @@ with TemporaryDirectory() as directory:
              patch.object(kakera, "telegram_send", side_effect=ValueError("api")):
             success, message = kakera.telegram_only_url(transient_url, None)
         assert not success and message == "Telegram delivery uncertain; check the configured chat before retrying"
+        with patch.object(kakera, "fetch_source", side_effect=failing_fetch), \
+             patch.object(kakera, "telegram_send", side_effect=ValueError(
+                 "Telegram request failed: Bad Request: chat not found")):
+            success, message = kakera.telegram_only_url(transient_url, None)
+        assert not success and message == "Telegram request failed: Bad Request: chat not found"
         assert created and not created[-1].exists()
         created.clear()
         def exception_fetch(_url, _browser, _account, _twitter, directory, _name, include_video=False):
@@ -2809,7 +2832,7 @@ with TemporaryDirectory() as directory:
              patch.object(kakera, "telegram_send") as send:
             success, message = kakera.telegram_only_url(transient_url, None)
         assert not success and "Telegram not sent" in message and not send.called
-        with patch.object(kakera.sys, "argv", ["kakera.py", "--telegram-only", transient_url,
+        with patch.object(kakera.sys, "argv", ["kakera.py", "--share", "telegram-only", transient_url,
                                                   "https://instagram.com/p/SECOND"]), \
              patch.object(kakera, "telegram_only_url", side_effect=[
                  (True, "Telegram sent 1 image(s) to 123; nothing saved"),
@@ -2817,7 +2840,7 @@ with TemporaryDirectory() as directory:
              ]) as transient_send:
             assert kakera.main() == 1
         assert transient_send.call_count == 2
-        with patch.object(kakera.sys, "argv", ["kakera.py", "--telegram-only", "--browser", "safari", transient_url]), \
+        with patch.object(kakera.sys, "argv", ["kakera.py", "--share", "telegram-only", "--browser", "safari", transient_url]), \
              patch.object(kakera, "telegram_only_url", return_value=(True, "ok")) as allowed:
             assert kakera.main() == 0
         assert allowed.call_args.args[1] == "safari"
@@ -2879,22 +2902,282 @@ with TemporaryDirectory() as directory:
                                 capture_output=True, text=True)
         return result.returncode, args_file.read_text().splitlines()
 
-    code, argv = launcher("--telegram-only", "https://example.test/a")
-    assert code == 0 and "--obsidian" not in argv and "--telegram-only" in argv
-    code, argv = launcher("local", "--telegram-only", "https://example.test/a")
-    assert code == 0 and "--local" in argv and "--telegram-only" in argv
-    code, argv = launcher("telegram-only", "Note.md")
+    code, argv = launcher("--share", "telegram-only", "https://example.test/a")
+    assert code == 0 and "--obsidian" not in argv and "--share" in argv and "telegram-only" in argv
+    code, argv = launcher("local", "--share", "telegram-only", "https://example.test/a")
+    assert code == 0 and "--local" in argv and "--share" in argv and "telegram-only" in argv
+    code, argv = launcher("share", "telegram-only", "Note.md")
     assert code == 0 and "--telegram-note-only" in argv and "Note.md" in argv
-    code, argv = launcher("telegram", "local")
+    code, argv = launcher("share", "telegram", "local")
     assert code == 0 and "--telegram-note" in argv and "local" in argv
-    code, argv = launcher("telegram-only", "inbox")
+    code, argv = launcher("share", "telegram-only", "inbox")
     assert code == 0 and "--telegram-note-only" in argv and "inbox" in argv
+    code, argv = launcher("telegram", "--watch")
+    assert code == 0 and "--telegram-intake" in argv and "--watch" in argv
+    code, argv = launcher("--share", "telegram", "https://example.test/a")
+    assert code == 0 and "--obsidian" in argv and "--share" in argv and "telegram" in argv
+    result = subprocess.run(
+        [str(kakera.ROOT / "kakera"), "share"], env=environment, capture_output=True, text=True
+    )
+    assert result.returncode == 2 and "telegram or telegram-only" in result.stderr
 
     for command in (("local", "telegram-only", "https://example.test/a"),
                     ("inbox", "telegram-only", "https://example.test/a"),
-                    ("telegram", "telegram-only", "Note.md")):
+                    ("telegram", "telegram-only", "Note.md"),
+                    ("share", "telegram-only", "Note.md")):
         result = subprocess.run(
             [os.sys.executable, str(kakera.ROOT / "kakera.py"), *command],
             capture_output=True, text=True,
         )
         assert result.returncode == 2 and "pseudo-subcommands" in result.stderr
+
+
+assert kakera.telegram_sender_name({"username": "imjma", "first_name": "J", "id": 42}) == "@imjma"
+assert kakera.telegram_sender_name({"first_name": "Ada", "last_name": "Lovelace", "id": 1}) == "Ada Lovelace"
+assert kakera.telegram_sender_name({"first_name": "Ada", "id": 1}) == "Ada"
+assert kakera.telegram_sender_name({"id": 1, "username": "x"}) is None
+assert kakera._telegram_caption_text("Title", "https://example.test/a", sender="@imjma") == (
+    "Title\nhttps://example.test/a\nfrom @imjma"
+)
+assert kakera._telegram_caption_text("Title", None, sender="Ada Lovelace") == "Title\nfrom Ada Lovelace"
+
+class _TelegramJsonResponse:
+    def __init__(self, body):
+        self.body = body
+        self.status = 200
+    def __enter__(self):
+        return self
+    def __exit__(self, *_arguments):
+        return False
+    def read(self):
+        return self.body
+
+with patch.object(kakera, "urlopen", return_value=_TelegramJsonResponse(
+        b'{"ok":false,"error_code":409,"description":"Conflict: terminated by other getUpdates request"}')):
+    try:
+        kakera.telegram_get_updates("secret-token", None, 0)
+    except ValueError as error:
+        assert str(error) == "Telegram getUpdates conflict; another consumer is using this bot"
+        assert "secret" not in str(error)
+    else:
+        raise AssertionError("accepted getUpdates conflict")
+with patch.object(kakera, "urlopen", return_value=_TelegramJsonResponse(
+        b'{"ok":false,"description":"Unauthorized"}')):
+    try:
+        kakera.telegram_json("getUpdates", "secret-token", {"timeout": 0})
+    except ValueError as error:
+        assert str(error) == "Telegram request failed: Unauthorized"
+        assert "secret" not in str(error)
+    else:
+        raise AssertionError("accepted unauthorized Telegram JSON")
+with patch.object(kakera, "urlopen", side_effect=TimeoutError("timed out")):
+    try:
+        kakera.telegram_json("getUpdates", "secret-token", {"timeout": 0})
+    except ValueError as error:
+        assert str(error) == "Telegram request timed out"
+    else:
+        raise AssertionError("accepted Telegram timeout")
+
+assert kakera.source_service_urls(
+    "see https://www.instagram.com/p/ABC/ and https://example.com/nope "
+    "https://x.com/a/status/1."
+) == ["https://www.instagram.com/p/ABC/", "https://x.com/a/status/1"]
+assert kakera.source_service_urls("https://example.com/x") == []
+assert kakera.canonical_telegram_user_id("00123") == 123
+for bad in (True, "12x", "", 0, -1, " -1"):
+    try:
+        kakera.canonical_telegram_user_id(bad)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"accepted invalid Telegram user ID {bad!r}")
+
+allowed = {42}
+private = {
+    "update_id": 7,
+    "message": {
+        "chat": {"id": 42, "type": "private"},
+        "from": {"id": 42, "is_bot": False},
+        "text": "https://www.instagram.com/p/ABC/",
+    },
+}
+message, chat_id = kakera.intake_private_message(private, allowed)
+assert chat_id == "42"
+assert kakera.intake_message_urls(message) == ["https://www.instagram.com/p/ABC/"]
+captioned = {
+    "update_id": 8,
+    "message": {
+        "chat": {"id": 42, "type": "private"},
+        "from": {"id": 42, "is_bot": False},
+        "caption": "https://x.com/a/status/9",
+    },
+}
+caption_message, _ = kakera.intake_private_message(captioned, allowed)
+assert kakera.intake_message_urls(caption_message) == ["https://x.com/a/status/9"]
+group = {
+    "update_id": 9,
+    "message": {
+        "chat": {"id": -100, "type": "supergroup"},
+        "from": {"id": 42, "is_bot": False},
+        "text": "https://www.instagram.com/p/ABC/",
+    },
+}
+assert kakera.intake_private_message(group, allowed) == (None, None)
+stranger = {
+    "update_id": 10,
+    "message": {
+        "chat": {"id": 99, "type": "private"},
+        "from": {"id": 99, "is_bot": False},
+        "text": "https://www.instagram.com/p/ABC/",
+    },
+}
+assert kakera.intake_private_message(stranger, allowed) == (None, None)
+edited = {
+    "update_id": 11,
+    "edited_message": private["message"],
+}
+assert kakera.intake_private_message(edited, allowed) == (None, None)
+
+with TemporaryDirectory() as directory:
+    root = Path(directory)
+    state = root / "kakera.telegram-state.json"
+    config = root / "kakera.json"
+    config.write_text(json.dumps({
+        "telegram": {"chat_id": "-1001", "allowed_user_ids": [42, "42", "43"]},
+    }))
+    with patch.object(kakera, "CONFIG", config):
+        assert kakera.configured_telegram_allowed_user_ids() == [42, 43]
+    for payload in (
+        {"telegram": {"chat_id": "-1001"}},
+        {"telegram": {"chat_id": "-1001", "allowed_user_ids": []}},
+        {"telegram": {"chat_id": "-1001", "allowed_user_ids": [0]}},
+        {"telegram": {"chat_id": "-1001", "allowed_user_ids": ["x"]}},
+    ):
+        config.write_text(json.dumps(payload))
+        with patch.object(kakera, "CONFIG", config):
+            try:
+                kakera.configured_telegram_allowed_user_ids()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"accepted invalid allowlist {payload!r}")
+
+    config.write_text(json.dumps({
+        "telegram": {"chat_id": "-1001", "allowed_user_ids": [42]},
+    }))
+    instagram = "https://www.instagram.com/p/INTAKE/"
+    twitter = "https://x.com/a/status/99"
+    dm = {
+        "update_id": 15,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False, "username": "imjma", "first_name": "J"},
+            "text": f"{instagram} {twitter}",
+        },
+    }
+    skipped = {
+        "update_id": 16,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False},
+            "text": "hello",
+        },
+    }
+    replies = []
+    seen_offsets = []
+    updates = [[dm, skipped], []]
+
+    def fake_updates(_token, offset, timeout):
+        seen_offsets.append((offset, timeout))
+        return updates.pop(0)
+
+    with (
+        patch.object(kakera, "CONFIG", config),
+        patch.object(kakera, "TELEGRAM_STATE", state),
+        patch.dict(kakera.os.environ, {"TELEGRAM_BOT_TOKEN": "secret"}),
+        patch.object(kakera, "telegram_webhook_url", return_value=""),
+        patch.object(kakera, "telegram_get_updates", side_effect=fake_updates),
+        patch.object(kakera, "telegram_only_url", side_effect=[
+            (True, "Telegram sent 1 image(s) to -1001; nothing saved"),
+            (False, "Telegram not sent: failed"),
+        ]) as send,
+        patch.object(kakera, "telegram_send_text", side_effect=lambda *args: replies.append(args)),
+    ):
+        assert kakera.telegram_intake(None, None, None, watch=False) == 1
+    assert [call.args[0] for call in send.call_args_list] == [instagram, twitter]
+    assert all(call.kwargs.get("sender") == "@imjma" for call in send.call_args_list)
+    assert replies and replies[0][0] == "42" and twitter in replies[0][1] and instagram not in replies[0][1]
+    assert json.loads(state.read_text()) == {"update_id": 16}
+    assert seen_offsets[0] == (None, 0) and seen_offsets[1][0] == 17
+
+    with (
+        patch.object(kakera, "CONFIG", config),
+        patch.object(kakera, "TELEGRAM_STATE", state),
+        patch.dict(kakera.os.environ, {"TELEGRAM_BOT_TOKEN": "secret"}),
+        patch.object(kakera, "telegram_webhook_url", return_value="https://example.test/hook"),
+    ):
+        try:
+            kakera.telegram_intake(None, None, None, watch=False)
+        except ValueError as error:
+            assert "webhook" in str(error)
+        else:
+            raise AssertionError("accepted Telegram webhook")
+
+    with patch.object(kakera, "TELEGRAM_STATE", state):
+        with kakera.telegram_intake_state():
+            try:
+                with kakera.telegram_intake_state():
+                    raise AssertionError("second intake lock was accepted")
+            except ValueError as error:
+                assert "already running" in str(error)
+
+    with (
+        patch.object(kakera, "configured_folders", side_effect=AssertionError("intake used folders")),
+        patch.object(kakera, "telegram_intake", return_value=0) as intake,
+        patch.object(kakera.sys, "argv", ["kakera.py", "--telegram-intake"]),
+    ):
+        assert kakera.main() == 0
+    assert intake.call_args.kwargs["watch"] is False
+
+    with (
+        patch.object(kakera, "telegram_intake", return_value=0) as intake,
+        patch.object(kakera.sys, "argv", ["kakera.py", "--telegram-intake", "--watch", "--browser", "safari"]),
+    ):
+        assert kakera.main() == 0
+    assert intake.call_args.kwargs["watch"] is True
+    assert intake.call_args.args[0] == "safari"
+
+    watch_output = io.StringIO()
+    with (
+        patch.object(kakera, "TELEGRAM_STATE", state),
+        patch.object(kakera, "telegram_webhook_url", return_value=""),
+        patch.object(kakera, "CONFIG", config),
+        patch.dict(kakera.os.environ, {"TELEGRAM_BOT_TOKEN": "secret"}),
+        patch.object(kakera, "consume_telegram_updates", side_effect=KeyboardInterrupt),
+        redirect_stdout(watch_output),
+    ):
+        assert kakera.telegram_intake(None, None, None, watch=True) == 0
+    assert re.search(
+        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ok: watching Telegram Intake",
+        watch_output.getvalue(),
+    )
+    assert re.search(
+        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ok: stopped watching Telegram Intake",
+        watch_output.getvalue(),
+    )
+
+    empty_config = root / "empty.json"
+    empty_config.write_text(json.dumps({"telegram": {"chat_id": "-1001"}}))
+    with (
+        patch.object(kakera, "CONFIG", empty_config),
+        patch.dict(kakera.os.environ, {"TELEGRAM_BOT_TOKEN": "secret"}),
+        patch.object(kakera, "telegram_webhook_url", return_value=""),
+        patch.object(kakera.sys, "argv", ["kakera.py", "--telegram-intake"]),
+        redirect_stderr(io.StringIO()),
+    ):
+        try:
+            kakera.main()
+        except SystemExit as error:
+            assert error.code == 2
+        else:
+            raise AssertionError("accepted telegram intake without allowlist")

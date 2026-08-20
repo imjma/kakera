@@ -6,7 +6,8 @@ Kakera saves images and source metadata from Instagram, Twitter/X, Reddit, and
 public RedNote posts as local Captures with portable Markdown Source Notes. It
 can write ordinary local folders or the configured folders inside an Obsidian
 vault, and can publish a Telegram Delivery from a current Capture, an existing
-note, or a submitted URL.
+note, a submitted URL, or a Source Service URL in an allowed user's private
+Telegram message.
 
 ## Requirements
 
@@ -54,13 +55,15 @@ Add `~/.local/bin` to `PATH` if necessary.
 
 ## Commands
 
-URL capture modes accept multiple URL arguments. `--telegram-only` also accepts
-multiple URLs and publishes each independently. The `telegram` and
-`telegram-only` note commands accept exact note selectors, including an
+URL capture modes accept multiple URL arguments. `--share telegram-only` also
+accepts multiple URLs and publishes each independently. The `share telegram` and
+`share telegram-only` note commands accept exact note selectors, including an
 existing note's exact source URL; they publish the matched note only, never
-fetch that source or fall back to another command. The default URL mode writes
-to the configured Obsidian folders; `local` writes to this repository's local
-folders. Inbox, Todoist, cookie-export, and OAuth commands do not accept URLs.
+fetch that source or fall back to another command. `kakera telegram` is Telegram
+Intake: it reads allowed users' private messages, not note selectors. The
+default URL mode writes to the configured Obsidian folders; `local` writes to
+this repository's local folders. Inbox, Todoist, Telegram Intake, cookie-export,
+and OAuth commands do not accept URLs.
 
 | Command | Purpose |
 | --- | --- |
@@ -69,9 +72,9 @@ folders. Inbox, Todoist, cookie-export, and OAuth commands do not accept URLs.
 | `./kakera --compose URL [URL ...]` | Compose URL(s) into one Source Note; the first URL stays primary. |
 | `./kakera local --compose URL [URL ...]` | Compose into local `downloads/` and `attachments/`. |
 | `./kakera [local] [--compose] [--tag TAG]... URL [URL ...]` | Add repeatable Capture Tags to direct, local, or composed captures; Inbox and Todoist accept the same `[--tag TAG]...` modifier without URL arguments. |
-| `./kakera --telegram URL [URL ...]` | Capture to configured Obsidian folders and publish each current request to Telegram. |
-| `./kakera local --telegram URL [URL ...]` | Capture locally and publish each current request to Telegram. |
-| `./kakera --compose --telegram URL1 URL2` | Compose into one configured Source Note, then publish it to Telegram. |
+| `./kakera --share telegram URL [URL ...]` | Capture to configured Obsidian folders and publish each current request to Telegram. |
+| `./kakera local --share telegram URL [URL ...]` | Capture locally and publish each current request to Telegram. |
+| `./kakera --compose --share telegram URL1 URL2` | Compose into one configured Source Note, then publish it to Telegram. |
 | `./kakera --tag share/telegram URL` | Request Telegram delivery through the canonical current-request tag. |
 | `./kakera --browser safari URL` | Use Safari cookies for this run; overrides `browser` in `kakera.json`. |
 | `./kakera --account personal URL` | Use a saved Instagram cookie account. |
@@ -81,9 +84,11 @@ folders. Inbox, Todoist, cookie-export, and OAuth commands do not accept URLs.
 | `./kakera todoist` | Process open tasks in the configured Todoist project. |
 | `./kakera todoist --watch` | Process Todoist and poll every 3 minutes until Ctrl-C. |
 | `./kakera inbox --watch --interval 30s` | Override the watch poll interval. `30s`, `3m`, and `1h` are accepted. |
-| `./kakera telegram SELECTOR [SELECTOR ...]` | Publish existing notes from the configured notes folder; acknowledged notes ask before resending. This is manual note publishing, not capture. |
-| `./kakera telegram-only SELECTOR [SELECTOR ...]` | Publish existing notes every time, without reading, prompting on, or writing Telegram receipts. |
-| `./kakera --telegram-only URL [URL ...]` | Fetch each URL to temporary storage and publish it without creating notes, attachments, tags, queues, or receipts. |
+| `./kakera telegram` | Drain pending private messages to the bot (Telegram Intake) and publish recognized Source Service URLs as Transient Telegram Deliveries. |
+| `./kakera telegram --watch` | Watch Telegram Intake until Ctrl-C. Long-polls; `--interval` is rejected. |
+| `./kakera share telegram SELECTOR [SELECTOR ...]` | Publish existing notes from the configured notes folder; acknowledged notes ask before resending. This is manual note publishing, not capture. |
+| `./kakera share telegram-only SELECTOR [SELECTOR ...]` | Publish existing notes every time, without reading, prompting on, or writing Telegram receipts. |
+| `./kakera --share telegram-only URL [URL ...]` | Fetch each URL to temporary storage and publish it without creating notes, attachments, tags, queues, or receipts. |
 | `./kakera instagram-cookies ALIAS --browser safari` | Save the browser's Instagram cookies locally. |
 | `./kakera twitter-cookies ALIAS --browser safari` | Save the browser's Twitter/X cookies locally. |
 | `./kakera reddit-oauth [USERNAME]` | Authorize Reddit and update `kakera.json`; without a username it prompts. |
@@ -95,8 +100,9 @@ Options may follow the subcommand. These are valid examples:
 ```sh
 ./kakera --browser safari URL
 ./kakera local --browser safari URL
-./kakera --telegram URL
-./kakera local --telegram URL
+./kakera --share telegram URL
+./kakera local --share telegram URL
+./kakera --compose --share telegram URL1 URL2
 ./kakera inbox --browser safari --watch
 ./kakera todoist --browser safari --watch
 ./kakera inbox --watch --interval 30s
@@ -112,24 +118,29 @@ Options may follow the subcommand. These are valid examples:
 ./kakera todoist --tag reading --watch
 ./kakera inbox --tag share/telegram --watch
 ./kakera todoist --tag share/telegram --watch
-./kakera telegram "Folder/Note.md"
-./kakera telegram-only "Folder/Note.md"
-./kakera --telegram-only https://www.instagram.com/p/ABC/
-./kakera --telegram-only --browser safari https://www.instagram.com/p/ABC/
-./kakera --telegram-only --account personal https://www.instagram.com/p/ABC/
-./kakera --telegram-only --twitter-account imjma https://x.com/user/status/123
+./kakera inbox --tag share/telegram-only --watch
+./kakera todoist --tag share/telegram-only --watch
+./kakera telegram
+./kakera telegram --watch
+./kakera telegram --browser safari --watch
+./kakera share telegram "Folder/Note.md"
+./kakera share telegram-only "Folder/Note.md"
+./kakera --share telegram-only https://www.instagram.com/p/ABC/
+./kakera --share telegram-only --browser safari https://www.instagram.com/p/ABC/
+./kakera --share telegram-only --account personal https://www.instagram.com/p/ABC/
+./kakera --share telegram-only --twitter-account imjma https://x.com/user/status/123
 ```
 
-`--telegram-only` must be the first command word; source-auth options such as
+`--share telegram-only` must be the first command flag; source-auth options such as
 `--browser`, `--account`, or `--twitter-account` follow it. It never falls back
-to `telegram` or `telegram-only` note publishing. Those note commands use
+to `share telegram` or `share telegram-only` note publishing. Those note commands use
 exact selectors—including an existing note's source URL—and never fetch or
-fall back to capture publishing.
+fall back to capture publishing. `kakera telegram` is Intake, not note publishing.
 
 `--browser safari` in these examples overrides the configured browser for that
-invocation, including Inbox, Todoist, and cookie-export commands. Use
-`--account` or `--twitter-account` to select a saved service account; an
-explicit service account takes precedence over `--browser`.
+invocation, including Inbox, Todoist, Telegram Intake, and cookie-export
+commands. Use `--account` or `--twitter-account` to select a saved service
+account; an explicit service account takes precedence over `--browser`.
 
 For each service, credential precedence is:
 
@@ -196,7 +207,8 @@ Start with this base configuration:
     "interval": "3m"
   },
   "telegram": {
-    "chat_id": "-1001234567890"
+    "chat_id": "-1001234567890",
+    "allowed_user_ids": [123456789]
   }
 }
 ```
@@ -213,7 +225,12 @@ Optional account fragments:
 `obsidian.interval` is the Inbox `--watch` poll; `todoist.interval` is the
 Todoist `--watch` poll. Each value is an integer plus `s`, `m`, or `h`. These
 are the built-in defaults; omit a key to keep them. `--interval` overrides the
-matching key for that invocation and requires `--watch`.
+matching key for that invocation and requires `--watch`. Telegram Intake
+long-polls and rejects `--interval`.
+
+`telegram.allowed_user_ids` is required for `kakera telegram`. It is a non-empty
+array of numeric Telegram user IDs whose private messages may become Transient
+Telegram Deliveries. Missing, empty, or non-numeric values refuse to start.
 
 `obsidian.vault` is the existing vault directory; `~` is expanded. `notes`,
 `attachments`, and `inbox` are paths relative to that vault: they are the
@@ -304,21 +321,57 @@ cannot be used while a webhook is active; see the official
 [`getUpdates` documentation](https://core.telegram.org/bots/api#getupdates) for
 the supported update modes. Put the resulting integer in `kakera.json`, for
 example `"chat_id": -1001234567890`; channel and supergroup IDs commonly have
-the `-100` prefix.
+the `-100` prefix. For a private chat with the bot, the printed chat ID is the
+user ID for `telegram.allowed_user_ids`.
+
+#### Telegram Intake
+
+`kakera telegram` reads private messages to the bot from allowed users. Each
+recognized Instagram, Twitter/X, Reddit, or RedNote URL becomes a Transient
+Telegram Delivery to `telegram.chat_id`. Nothing is stored. Video is allowed.
+A later DM with the same URL sends again. Group messages, message edits, and
+users not on the allowlist are ignored.
+
+```sh
+./kakera telegram
+./kakera telegram --watch
+./kakera telegram --browser safari --watch
+```
+
+Without `--watch`, pending updates are drained and the process exits. `--watch`
+long-polls until Ctrl-C. `--interval` is rejected. `--browser`, `--account`, and
+`--twitter-account` are the only source-auth options.
+
+A DM with two Source Service URLs is two independent Deliveries. Unsupported
+URLs are ignored. Success is the group Delivery; Kakera does not reply in the
+DM on success. Failure replies in that private chat; retry by sending a new
+message. The group caption names the sender with `@username`, or their display
+name if they have no username — never the numeric user ID:
+
+```text
+Post title - Instagram
+https://www.instagram.com/p/ABC/
+from @imjma
+```
+
+The last consumed Telegram `update_id` is stored in `kakera.telegram-state.json`
+next to `kakera.json` (gitignored). A second `kakera telegram --watch` fails
+immediately. A webhook on this bot token refuses to start; delete it before
+Intake. `getUpdates` cannot run while a webhook is active.
 
 #### Automatic delivery
 
-`--telegram` is shorthand for adding the current-request tag `share/telegram`:
+`--share telegram` is shorthand for adding the current-request tag `share/telegram`:
 
 ```sh
-./kakera --telegram https://www.instagram.com/p/ABC/
-./kakera local --telegram https://x.com/user/status/123
-./kakera --compose --telegram URL1 URL2
+./kakera --share telegram https://www.instagram.com/p/ABC/
+./kakera local --share telegram https://x.com/user/status/123
+./kakera --compose --share telegram URL1 URL2
 ./kakera --tag share/telegram URL
 ```
 
 The note and local attachments are saved first. For configured automatic
-captures, both are inside the configured Obsidian vault. For `local --telegram`,
+captures, both are inside the configured Obsidian vault. For `local --share telegram`,
 the note and images stay in Kakera's local `downloads/` and `attachments/`
 output roots. A Telegram failure reports the capture as saved but returns
 failure, so an Inbox or Todoist task remains pending for retry. The persisted
@@ -349,7 +402,7 @@ keeps it pending.
 sent independently, nothing is stored, and there is no Share Receipt. The group
 is checked/closed only when every URL delivers; any failure keeps it pending.
 If both tags are present, `share/telegram-only` wins. Direct URL captures still
-use `--telegram-only`.
+use `--share telegram-only`.
 
 ```md
 - [ ] #share/telegram-only https://www.instagram.com/p/ABC/
@@ -362,18 +415,19 @@ use `--telegram-only`.
 
 #### Publish existing notes
 
-`kakera telegram` is the manual path for notes already in the configured
+`kakera share telegram` is the manual path for notes already in the configured
 `obsidian.notes` folder; its note must be in that folder and its selected images
 must resolve inside the configured vault. It does not recapture the source or
-add the `share/telegram` tag:
+add the `share/telegram` tag. `kakera telegram` without `share` is Intake, not
+this command.
 
 ```sh
-./kakera telegram https://www.instagram.com/p/ABC/
-./kakera telegram "Folder/Note.md"
-./kakera telegram "/absolute/path/inside/the/notes/folder/Note.md"
-./kakera telegram "Note title"
-./kakera telegram "[[Folder/Note|display alias]]"
-./kakera telegram "Note A" "Folder/Note B.md"
+./kakera share telegram https://www.instagram.com/p/ABC/
+./kakera share telegram "Folder/Note.md"
+./kakera share telegram "/absolute/path/inside/the/notes/folder/Note.md"
+./kakera share telegram "Note title"
+./kakera share telegram "[[Folder/Note|display alias]]"
+./kakera share telegram "Note A" "Folder/Note B.md"
 ```
 
 Selectors are exact: source URL, notes-relative path, an absolute path only
@@ -394,7 +448,7 @@ For manual note publishing, Kakera reads local Markdown images such as
 `![](../attachments/photo.jpg)` and Obsidian embeds such as
 `![[attachments/photo.jpg]]` in document order. It resolves and deduplicates
 real paths inside the configured vault. Automatic captures use their configured
-vault or, for `local --telegram`, Kakera's local output roots. Remote URLs,
+vault or, for `local --share telegram`, Kakera's local output roots. Remote URLs,
 `data:` URLs, missing files, non-images, escaping paths, and ambiguous bare
 image names are not fetched or sent. Files over 10 MB are skipped, and the
 first ten eligible images are sent. A single image uses `sendPhoto`; two
@@ -406,8 +460,25 @@ The caption contains only the actual note filename stem on line one for an
 existing note, or the prospective Source Note name derived from fetched
 metadata and service for a transient URL. The transient name is only a
 caption value; no Source Note is created. When the complete caption fits
-Telegram's 1,024-character limit, one source URL appears on line two. It does
-not include note body text, title fields, tags, or follow-up text.
+Telegram's 1,024-character limit, one source URL appears on line two. A
+Telegram Intake Delivery then adds `from @username` or `from Display Name` on
+the next line. It does not include note body text, title fields, tags, or
+follow-up text.
+
+Capture, note, and `--share telegram-only` captions look like:
+
+```text
+Post title - Instagram
+https://www.instagram.com/p/ABC/
+```
+
+A Telegram Intake Delivery adds the sender:
+
+```text
+Post title - Instagram
+https://www.instagram.com/p/ABC/
+from @imjma
+```
 
 After acknowledgement, the note stores the latest message IDs per chat in the
 `kakera.shared.telegram` namespace:
@@ -423,13 +494,13 @@ partial state instead of silently claiming success.
 
 #### No-storage publishing
 
-`kakera telegram-only SELECTOR...` uses the same exact selectors, note-folder
+`kakera share telegram-only SELECTOR...` uses the same exact selectors, note-folder
 boundary, vault-contained local embeds, image limits, and caption rules as the
-receipt-aware `telegram` command. It never reads receipts, prompts, changes
+receipt-aware `share telegram` command. It never reads receipts, prompts, changes
 notes, or creates a receipt, so every invocation sends again. It accepts no
 capture, queue, account, cookie, or OAuth options.
 
-`kakera --telegram-only URL...` validates the Telegram configuration and token,
+`kakera --share telegram-only URL...` validates the Telegram configuration and token,
 fetches each URL completely into one private temporary directory, and sends the
 first ten eligible local images and MP4 videos, in source order. It creates no
 note, attachment, output folder, tag, queue state, or receipt; temporary files
@@ -442,11 +513,11 @@ source-auth options. Capture/composition flags, explicit output folders, tags,
 Inbox/Todoist/`--watch`, cookie exports, and OAuth are rejected. It must not be
 used as a fallback for either note-publishing command.
 
-`--telegram-only` / queue `share/telegram-only` can publish MP4 video from
-Instagram, Twitter/X, Reddit, and RedNote. Capture, `share/telegram`, and
-note-publishing commands stay image-only and do not download video. These
-no-storage modes do not compose sources, process Inbox/Todoist/watch, or fetch
-remote images embedded in an existing note.
+`--share telegram-only` / queue `share/telegram-only` / Telegram Intake can
+publish MP4 video from Instagram, Twitter/X, Reddit, and RedNote. Capture,
+`share/telegram`, and note-publishing commands stay image-only and do not
+download video. These no-storage modes do not compose sources, process
+Inbox/Todoist/watch, or fetch remote images embedded in an existing note.
 
 #### Telegram troubleshooting
 
@@ -454,8 +525,13 @@ remote images embedded in an existing note.
 | --- | --- |
 | `TELEGRAM_BOT_TOKEN is not set` | Export the token in the shell running Kakera; never add it to JSON. |
 | Invalid `telegram.chat_id` | Use the exact numeric ID from `getUpdates`, including its minus sign; no `@username` or topic ID. |
+| Invalid `telegram.allowed_user_ids` | Non-empty array of numeric user IDs; required for `kakera telegram`. A private-chat ID from the snippet above is the user ID. |
 | Bot cannot send | Recheck channel **Post Messages** or group send-message/send-photo permissions. |
-| `getUpdates` is empty | Send a fresh group/channel event; check whether another consumer or webhook has consumed updates. |
+| `getUpdates` is empty | Send a fresh group/channel event or DM; check whether another consumer or webhook has consumed updates. |
+| `Telegram webhook is set` | Delete the webhook on this bot token; Intake uses `getUpdates` only. |
+| `telegram intake already running` | Another `kakera telegram` process holds the Intake lock. |
+| `Telegram getUpdates conflict` | Another process is calling `getUpdates` on this bot token (a second watch, another machine, or the chat-ID snippet). Stop the other consumer. |
+| `Telegram request failed: …` | Telegram returned that description; the token is valid enough to talk to the API, but this call was rejected. |
 | Existing-note has no eligible images | Check Markdown/Obsidian embed paths, image type, vault containment, and the 10 MB limit. Remote, data, missing, ambiguous, and outside-vault images are omitted. |
 | Transient URL has no eligible images or video | Check that the complete fetch produced supported local images or an MP4; partial/failed fetches are never sent. WebM and other non-MP4 video is ignored. |
 | Ambiguous note or image | Use the listed relative note path or a qualified embed/path. |
@@ -463,8 +539,9 @@ remote images embedded in an existing note.
 | Telegram sent but receipt update failed | Inspect the note for concurrent edits or filesystem/provider write errors; resend only after confirming Telegram state. |
 | Queue remains unchecked/open | This is intentional when capture or Telegram delivery failed; correct the cause and rerun. |
 
-The `reddit` section is added by `reddit-oauth`. `kakera.json`, `.cookies/`,
-`downloads/`, and `attachments/` are ignored by Git. Capture coordination locks
+The `reddit` section is added by `reddit-oauth`. `kakera.json`,
+`kakera.telegram-state.json`, `.cookies/`, `downloads/`, and `attachments/` are
+ignored by Git. Capture coordination locks
 live in the per-user runtime directory and do not appear in output folders.
 Their normalized case-insensitive identity can conservatively serialize two
 distinct case-sensitive paths; this trades some parallelism for safe aliasing.
@@ -635,18 +712,22 @@ post ID and service in the filename, for example
   change, rate-limit, or require a current logged-in browser session.
 - Twitter/X accepts individual status URLs and saves images only. Text-only,
   video-only, and image-free posts return `no supported images found`; videos
-  in mixed posts are ignored on Capture. `--telegram-only` can send the MP4.
+  in mixed posts are ignored on Capture. `--share telegram-only` and Telegram
+  Intake can send the MP4.
 - RedNote is limited to public page data and has a 5 MB page and 50 MB per-image
   or per-video limit. Gallery-dl captures are limited to 50 MB per file.
   Capture does not download RedNote video; Transient Telegram Delivery does.
 - Kakera does not bypass login walls, CAPTCHAs, private-post restrictions, or
   access controls, and native iOS/macOS apps are not part of v0.1.0.
-- Kakera processes only URLs you provide. For an explicitly requested Telegram
+- Kakera processes only URLs you provide, plus Source Service URLs in allowed
+  users' private Telegram messages when Telegram Intake is running. For an explicitly requested Telegram
   delivery, it sends the selected image bytes and, for Transient Telegram
   Delivery, MP4 video, the actual note stem (or a
-  transient source-derived prospective name), and optional source URL to
-  `api.telegram.org`; it does not send source text, tags, browser cookies, or
-  service account tokens as Telegram message content.
+  transient source-derived prospective name), optional source URL, and for
+  Telegram Intake the sender's `@username` or display name to
+  `api.telegram.org`; it does not send source text, tags, browser cookies,
+  numeric Telegram user IDs, or service account tokens as Telegram message
+  content.
 - Kakera has no Kakera-hosted relay service: capture extraction uses the
   configured source tools, and Telegram delivery goes directly to Telegram's
   Bot API. Remote note images are never downloaded for Telegram.

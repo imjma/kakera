@@ -4,9 +4,21 @@ case "${1:-}" in
   local) shift; exec uv run "$script" --local "$@" ;;
   inbox) shift; exec uv run "$script" --inbox "$@" ;;
   todoist) shift; exec uv run "$script" --todoist "$@" ;;
-  telegram) shift; exec uv run "$script" --telegram-note "$@" ;;
-  telegram-only) shift; exec uv run "$script" --telegram-note-only "$@" ;;
-  --telegram-only) exec uv run "$script" "$@" ;;
+  telegram) shift; exec uv run "$script" --telegram-intake "$@" ;;
+  share)
+    shift
+    case "${1:-}" in
+      telegram) shift; exec uv run "$script" --telegram-note "$@" ;;
+      telegram-only) shift; exec uv run "$script" --telegram-note-only "$@" ;;
+      *) echo "kakera share requires telegram or telegram-only" >&2; exit 2 ;;
+    esac
+    ;;
+  --share)
+    if [ "${2:-}" = "telegram-only" ]; then
+      exec uv run "$script" "$@"
+    fi
+    exec uv run "$script" --obsidian "$@"
+    ;;
   instagram-cookies) shift; exec uv run "$script" --instagram-cookies "$@" ;;
   twitter-cookies) shift; exec uv run "$script" --twitter-cookies "$@" ;;
   reddit-oauth) shift; exec uv run "$script" --reddit-oauth "$@" ;;

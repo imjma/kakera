@@ -21,6 +21,7 @@ import unicodedata
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
@@ -52,6 +53,8 @@ TELEGRAM_API = "https://api.telegram.org"
 TELEGRAM_RECEIPT = "kakera"
 TELEGRAM_TAG = "share/telegram"
 TELEGRAM_ONLY_TAG = "share/telegram-only"
+TELEGRAM_STATE = ROOT / "kakera.telegram-state.json"
+TELEGRAM_LONG_POLL = 60
 TELEGRAM_MAX_IMAGES = 10
 TELEGRAM_MAX_BYTES = 10 * 1024 * 1024
 TELEGRAM_MAX_VIDEO_BYTES = 50 * 1024 * 1024
@@ -546,6 +549,315 @@ def telegram_token() -> str:
     return token
 
 
+def canonical_telegram_user_id(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError("user ID must be numeric")
+    text = str(value).strip()
+    if not re.fullmatch(r"\d+", text):
+        raise ValueError("user ID must be numeric")
+    user_id = int(text)
+    if user_id <= 0:
+        raise ValueError("user ID must be numeric")
+    return user_id
+
+
+def configured_telegram_allowed_user_ids() -> list[int]:
+    telegram = read_config().get("telegram")
+    if not isinstance(telegram, dict):
+        raise ValueError(f"invalid {CONFIG.name}: telegram must be an object")
+    values = telegram.get("allowed_user_ids")
+    if not isinstance(values, list) or not values:
+        raise ValueError(
+            f"invalid {CONFIG.name}: telegram.allowed_user_ids must be a non-empty array of numeric user IDs"
+        )
+    ids = []
+    seen = set()
+    for value in values:
+        try:
+            user_id = canonical_telegram_user_id(value)
+        except ValueError as error:
+            raise ValueError(
+                f"invalid {CONFIG.name}: telegram.allowed_user_ids must be numeric user IDs"
+            ) from error
+        if user_id not in seen:
+            seen.add(user_id)
+            ids.append(user_id)
+    return ids
+
+
+def source_service_urls(text: str) -> list[str]:
+    found = []
+    for match in HTTP_URL.finditer(text):
+        url = match.group(0).rstrip(".,!?;:)]}")
+        try:
+            capture_id(url)
+        except ValueError:
+            continue
+        found.append(url)
+    return dedupe_urls(found)
+
+
+def _telegram_timeout_error(error: BaseException) -> bool:
+    if isinstance(error, TimeoutError):
+        return True
+    reason = getattr(error, "reason", None)
+    return isinstance(reason, TimeoutError) or "timed out" in str(reason or error).casefold()
+
+
+def _telegram_api_error(method: str, body: object = None, error: BaseException | None = None) -> ValueError:
+    description = body.get("description") if isinstance(body, dict) else None
+    code = body.get("error_code") if isinstance(body, dict) else None
+    http_code = getattr(error, "code", None)
+    if isinstance(description, str) and description.strip():
+        text = description.strip()
+        if "webhook" in text.casefold():
+            return ValueError("Telegram webhook is set; delete it before kakera telegram")
+        if (code == 409 or http_code == 409 or "terminated by other getUpdates" in text.casefold()
+                or (method == "getUpdates" and "conflict" in text.casefold())):
+            return ValueError("Telegram getUpdates conflict; another consumer is using this bot")
+        return ValueError(f"Telegram request failed: {text}")
+    if method == "getUpdates" and http_code == 409:
+        return ValueError("Telegram getUpdates conflict; another consumer is using this bot")
+    if error is not None and _telegram_timeout_error(error):
+        return ValueError("Telegram request timed out")
+    return ValueError("Telegram request failed")
+
+
+def _telegram_delivery_message(error: BaseException) -> str:
+    text = str(error)
+    if text.startswith("Telegram request failed: ") or "webhook" in text.casefold():
+        return text
+    return "Telegram delivery uncertain; check the configured chat before retrying"
+
+
+def telegram_json(method: str, token: str, payload: dict | None = None, *, timeout: int = 30):
+    request = Request(
+        f"{TELEGRAM_API}/bot{token}/{method}",
+        data=json.dumps({} if payload is None else payload).encode(),
+        headers={"Accept": "application/json", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            if getattr(response, "status", 200) >= 400:
+                raise OSError("Telegram HTTP error")
+            body = json.loads(response.read() or b"{}")
+    except HTTPError as error:
+        try:
+            body = json.loads(error.read() or b"{}")
+        except (OSError, json.JSONDecodeError, TypeError):
+            body = {}
+        raise _telegram_api_error(method, body, error) from error
+    except (OSError, json.JSONDecodeError, TypeError) as error:
+        raise _telegram_api_error(method, error=error) from error
+    if not isinstance(body, dict) or body.get("ok") is not True:
+        raise _telegram_api_error(method, body)
+    return body.get("result")
+
+
+def telegram_webhook_url(token: str) -> str:
+    result = telegram_json("getWebhookInfo", token)
+    if not isinstance(result, dict):
+        raise ValueError("Telegram request failed")
+    url = result.get("url")
+    if url in (None, ""):
+        return ""
+    if not isinstance(url, str):
+        raise ValueError("Telegram request failed")
+    return url
+
+
+def telegram_get_updates(token: str, offset: int | None, timeout: int) -> list[dict]:
+    payload = {"timeout": timeout, "allowed_updates": ["message"]}
+    if offset is not None:
+        payload["offset"] = offset
+    result = telegram_json("getUpdates", token, payload, timeout=timeout + 10)
+    if not isinstance(result, list):
+        raise ValueError("Telegram request failed")
+    updates = []
+    for item in result:
+        update_id = item.get("update_id") if isinstance(item, dict) else None
+        if isinstance(update_id, bool) or not isinstance(update_id, int):
+            raise ValueError("Telegram returned an invalid update")
+        updates.append(item)
+    return updates
+
+
+def telegram_send_text(chat_id: str, text: str, token: str) -> None:
+    telegram_json("sendMessage", token, {"chat_id": chat_id, "text": text[:4096]})
+
+
+@contextmanager
+def telegram_intake_state():
+    fd = os.open(TELEGRAM_STATE, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError("telegram intake already running") from None
+        try:
+            yield fd
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def telegram_intake_offset(fd: int) -> int | None:
+    os.lseek(fd, 0, os.SEEK_SET)
+    data = os.read(fd, 4096)
+    if not data.strip():
+        return None
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid {TELEGRAM_STATE.name}") from error
+    if not isinstance(payload, dict):
+        raise ValueError(f"invalid {TELEGRAM_STATE.name}")
+    value = payload.get("update_id")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"invalid {TELEGRAM_STATE.name}: update_id must be a non-negative integer")
+    return value
+
+
+def set_telegram_intake_offset(fd: int, update_id: int) -> None:
+    encoded = (json.dumps({"update_id": update_id}, separators=(",", ":")) + "\n").encode()
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    os.write(fd, encoded)
+    os.fsync(fd)
+
+
+def intake_message_urls(message: dict) -> list[str]:
+    chunks = []
+    for key in ("text", "caption"):
+        value = message.get(key)
+        if isinstance(value, str):
+            chunks.append(value)
+    return source_service_urls("\n".join(chunks))
+
+
+def intake_private_message(update: dict, allowed: set[int]) -> tuple[dict, str] | tuple[None, None]:
+    message = update.get("message")
+    if not isinstance(message, dict):
+        return None, None
+    chat = message.get("chat")
+    sender = message.get("from")
+    if not isinstance(chat, dict) or not isinstance(sender, dict):
+        return None, None
+    if chat.get("type") != "private" or sender.get("is_bot") is True:
+        return None, None
+    try:
+        user_id = canonical_telegram_user_id(sender.get("id"))
+        chat_id = canonical_telegram_chat_id(chat.get("id"))
+    except ValueError:
+        return None, None
+    if user_id not in allowed:
+        return None, None
+    return message, chat_id
+
+
+def process_intake_update(
+    update: dict,
+    allowed: set[int],
+    token: str,
+    browser: str | None,
+    account: str | None,
+    twitter_account: str | None,
+) -> bool:
+    message, chat_id = intake_private_message(update, allowed)
+    if message is None:
+        return False
+    urls = intake_message_urls(message)
+    if not urls:
+        return False
+    failed_lines = []
+    failed = False
+    for url in urls:
+        try:
+            success, text = telegram_only_url(
+                url, browser, account, twitter_account,
+                sender=telegram_sender_name(message.get("from") or {}),
+            )
+        except (OSError, ValueError) as error:
+            success, text = False, f"Telegram not sent: {error}"
+        shown = published_url(url)
+        print(f"{process_stamp()} {'ok' if success else 'error'}: {shown}: {text}")
+        if not success:
+            failed = True
+            failed_lines.append(f"{shown}: {text}")
+    if failed_lines:
+        try:
+            telegram_send_text(chat_id, "\n".join(failed_lines), token)
+        except ValueError as error:
+            stamp_print(f"error: cannot reply in Telegram: {error}", error=True)
+    return failed
+
+
+def consume_telegram_updates(
+    fd: int,
+    token: str,
+    browser: str | None,
+    account: str | None,
+    twitter_account: str | None,
+    timeout: int,
+) -> tuple[int, bool]:
+    allowed = set(configured_telegram_allowed_user_ids())
+    last = telegram_intake_offset(fd)
+    offset = last + 1 if last is not None else None
+    updates = telegram_get_updates(token, offset, timeout)
+    failed = False
+    for update in updates:
+        failed |= process_intake_update(update, allowed, token, browser, account, twitter_account)
+        set_telegram_intake_offset(fd, update["update_id"])
+    return len(updates), failed
+
+
+def telegram_intake(
+    browser: str | None,
+    account: str | None,
+    twitter_account: str | None,
+    *,
+    watch: bool,
+) -> int:
+    token = telegram_token()
+    configured_telegram_chat_id()
+    configured_telegram_allowed_user_ids()
+    if telegram_webhook_url(token):
+        raise ValueError("Telegram webhook is set; delete it before kakera telegram")
+    with telegram_intake_state() as fd:
+        if watch:
+            stamp_print("ok: watching Telegram Intake")
+            reported_error = None
+            try:
+                while True:
+                    try:
+                        consume_telegram_updates(
+                            fd, token, browser, account, twitter_account, TELEGRAM_LONG_POLL
+                        )
+                        reported_error = None
+                    except (OSError, ValueError) as error:
+                        if str(error) != reported_error:
+                            stamp_print(f"error: {error}", error=True)
+                            reported_error = str(error)
+                        time.sleep(1)
+            except KeyboardInterrupt:
+                stamp_print("ok: stopped watching Telegram Intake")
+                return 0
+        failed = False
+        while True:
+            count, batch_failed = consume_telegram_updates(
+                fd, token, browser, account, twitter_account, 0
+            )
+            failed |= batch_failed
+            if count == 0:
+                break
+        return int(failed)
+
+
 def todoist_request(token: str, path: str, method: str = "GET") -> dict | None:
     request = Request(
         f"{TODOIST_API}{path}",
@@ -650,6 +962,10 @@ def process_stamp() -> str:
     return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def stamp_print(message: str, *, error: bool = False) -> None:
+    print(f"{process_stamp()} {message}", file=sys.stderr if error else sys.stdout)
+
+
 def process_todoist(
     browser: str | None,
     notes: Path,
@@ -747,16 +1063,16 @@ def watch_todoist(
     twitter_account: str | None = None,
     tags: list[str] | None = None,
 ) -> int:
-    print("ok: watching Todoist")
+    stamp_print("ok: watching Todoist")
     try:
         while True:
             try:
                 process_todoist(browser, notes, attachments, account, twitter_account, tags)
             except (OSError, ValueError) as error:
-                print(f"error: {error}", file=sys.stderr)
+                stamp_print(f"error: {error}", error=True)
             time.sleep(interval)
     except KeyboardInterrupt:
-        print("ok: stopped watching Todoist")
+        stamp_print("ok: stopped watching Todoist")
         return 0
 
 
@@ -1633,12 +1949,34 @@ def _telegram_note_caption(note: Path, text: str, selected_url: str | None = Non
     )
 
 
-def _telegram_caption_text(stem: str, url: str | None, label: str = "note") -> str:
+def telegram_sender_name(sender: dict) -> str | None:
+    username = sender.get("username")
+    if isinstance(username, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", username):
+        return f"@{username}"
+    parts = []
+    for key in ("first_name", "last_name"):
+        value = sender.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(re.sub(r"[\r\n]+", " ", value).strip())
+    name = " ".join(parts).strip()
+    return name or None
+
+
+def _telegram_caption_text(stem: str, url: str | None, label: str = "note",
+                           sender: str | None = None) -> str:
     stem = stem.replace("\r", " ").replace("\n", " ")
+    credit = ("from " + sender.replace("\r", " ").replace("\n", " ")) if sender else None
+    lines = [stem]
     if url:
-        if len(stem) + 1 + len(url) <= 1024:
-            return f"{stem}\n{url}"
+        candidate = "\n".join(lines + [url] + ([credit] if credit else []))
+        if len(candidate) <= 1024:
+            return candidate
         print(f"warning: Telegram caption URL omitted because it does not fit: {label}", file=sys.stderr)
+    if credit:
+        candidate = f"{stem}\n{credit}"
+        if len(candidate) <= 1024:
+            return candidate
+        return candidate[:1024]
     return stem[:1024]
 
 
@@ -1748,10 +2086,16 @@ def telegram_send(chat_id: str, caption: str, images: list[Path], token: str | N
             if getattr(response, "status", 200) >= 400:
                 raise OSError("Telegram HTTP error")
             payload = json.loads(response.read() or b"{}")
+    except HTTPError as error:
+        try:
+            payload = json.loads(error.read() or b"{}")
+        except (OSError, json.JSONDecodeError, TypeError):
+            payload = {}
+        raise _telegram_api_error(method, payload, error) from error
     except (OSError, json.JSONDecodeError, TypeError) as error:
-        raise ValueError("Telegram request failed") from error
+        raise _telegram_api_error(method, error=error) from error
     if not isinstance(payload, dict) or payload.get("ok") is not True:
-        raise ValueError("Telegram rejected the delivery")
+        raise _telegram_api_error(method, payload)
     result = payload.get("result")
     messages = result if method == "sendMediaGroup" else [result]
     if (not isinstance(messages, list) or len(messages) != len(images)
@@ -1796,8 +2140,8 @@ def publish_telegram_note(note: Path, vault: Path, *, selected_url: str | None =
         # ponytail: network stays under the note lock; split decision/send/update only if throughput matters.
         try:
             message_ids = telegram_send(chat_id, caption, images, token)
-        except ValueError:
-            return False, "Telegram delivery uncertain; check the configured chat before retrying"
+        except ValueError as error:
+            return False, _telegram_delivery_message(error)
         # Re-read after Telegram acknowledges so concurrent Obsidian edits survive receipt writeback.
         try:
             latest = note.read_text()
@@ -1926,7 +2270,7 @@ def telegram_note_only_command(selectors: list[str]) -> int:
                     chat_id, _telegram_note_caption(note, text, selected_url), images, token
                 )
             except ValueError as error:
-                raise ValueError("Telegram delivery uncertain; check the configured chat before retrying") from error
+                raise ValueError(_telegram_delivery_message(error)) from error
             message = f"Telegram sent {len(message_ids)} image(s) to {chat_id}"
             print(f"ok: {note.relative_to(notes)}: {message}")
         except KeyboardInterrupt:
@@ -1939,7 +2283,8 @@ def telegram_note_only_command(selectors: list[str]) -> int:
 
 
 def telegram_only_url(url: str, browser: str | None, account: str | None = None,
-                      twitter_account: str | None = None) -> tuple[bool, str]:
+                      twitter_account: str | None = None, *,
+                      sender: str | None = None) -> tuple[bool, str]:
     """Fetch one URL to a temporary directory and publish it without saving."""
     chat_id = configured_telegram_chat_id()
     token = telegram_token()
@@ -1967,12 +2312,12 @@ def telegram_only_url(url: str, browser: str | None, account: str | None = None,
         metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
         stem = note_filename(metadata, source.get("service", "unknown"))
         caption = _telegram_caption_text(
-            stem, published_url(source.get("url") or url), url
+            stem, published_url(source.get("url") or url), url, sender=sender
         )
         try:
             telegram_send(chat_id, caption, files, token)
-        except ValueError:
-            return False, "Telegram delivery uncertain; check the configured chat before retrying"
+        except ValueError as error:
+            return False, _telegram_delivery_message(error)
         label = _telegram_count_label(files)
     return True, f"Telegram sent {label} to {chat_id}; nothing saved"
 
@@ -2424,7 +2769,7 @@ def process_inbox(
     if not inbox.exists():
         inbox.parent.mkdir(parents=True, exist_ok=True)
         inbox.write_text("# Kakera Inbox\n\n")
-        print(f"ok: created {inbox}")
+        stamp_print(f"ok: created {inbox}")
         return 0
 
     completed = completed if completed is not None else set()
@@ -2569,7 +2914,7 @@ def mark_completed_group(inbox: Path, group: dict) -> bool:
         replace_text(temporary, inbox)
         return False
     except (OSError, ValueError) as error:
-        print(f"error: cannot update {inbox}: {error}", file=sys.stderr)
+        stamp_print(f"error: cannot update {inbox}: {error}", error=True)
         return True
 
 
@@ -2623,7 +2968,7 @@ def mark_completed(inbox: Path, completed: set[str]) -> bool:
                 replace_text(temporary, inbox)
             completed.remove(url)
         except (OSError, ValueError) as error:
-            print(f"error: cannot update {inbox}: {error}", file=sys.stderr)
+            stamp_print(f"error: cannot update {inbox}: {error}", error=True)
             failed = True
     return failed
 
@@ -2643,7 +2988,7 @@ def watch_inbox(
         process_inbox(inbox, browser, notes, attachments, account, completed, False, twitter_account, tags)
     previous: object = object()
     reported_error = None
-    print(f"ok: watching {inbox}")
+    stamp_print(f"ok: watching {inbox}")
     try:
         while True:
             try:
@@ -2657,11 +3002,11 @@ def watch_inbox(
                 reported_error = None
             except (OSError, ValueError) as error:
                 if str(error) != reported_error:
-                    print(f"error: {error}", file=sys.stderr)
+                    stamp_print(f"error: {error}", error=True)
                     reported_error = str(error)
             time.sleep(interval)
     except KeyboardInterrupt:
-        print("ok: stopped watching inbox")
+        stamp_print("ok: stopped watching inbox")
         return 0
 
 
@@ -2669,9 +3014,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=("Save Instagram, Twitter/X, Reddit, and RedNote images as local Captures "
                      "or publish Telegram Deliveries."),
-        epilog=("Forms: kakera --telegram URL [URL ...]; kakera telegram SELECTOR [SELECTOR ...]; "
-                "kakera telegram-only SELECTOR [SELECTOR ...]; "
-                "kakera --telegram-only URL [URL ...]. "
+        epilog=("Forms: kakera --share telegram URL [URL ...]; "
+                "kakera --compose --share telegram URL [URL ...]; "
+                "kakera share telegram SELECTOR [SELECTOR ...]; "
+                "kakera share telegram-only SELECTOR [SELECTOR ...]; "
+                "kakera --share telegram-only URL [URL ...]; kakera telegram [--watch]. "
                 "Use --tag share/telegram for the current Capture request."),
     )
     parser.add_argument("--version", action="version", version=f"Kakera {VERSION}")
@@ -2686,18 +3033,21 @@ def main() -> int:
     parser.add_argument("--twitter-account", help="saved Twitter account alias")
     parser.add_argument("--obsidian", action="store_true", help=f"use folders from {CONFIG.name}")
     parser.add_argument("--inbox", action="store_true", help="process unchecked links in the Obsidian inbox")
-    parser.add_argument("--watch", action="store_true", help="keep watching the inbox or Todoist")
+    parser.add_argument("--watch", action="store_true",
+                        help="keep watching the inbox, Todoist, or Telegram Intake")
     parser.add_argument("--interval", metavar="DURATION",
                         help="watch poll interval, e.g. 30s, 3m, 1h")
     parser.add_argument("--todoist", action="store_true", help="process open Todoist tasks")
     parser.add_argument("--compose", action="store_true",
                         help="compose multiple URLs into one Source Note")
-    parser.add_argument("--telegram", action="store_true",
-                        help="save the Capture first, then publish this request to Telegram")
+    parser.add_argument(
+        "--share", choices=("telegram", "telegram-only"),
+        help=("telegram: save the Capture first, then publish this request to Telegram; "
+              "telegram-only: fetch and publish URLs with no durable Kakera output"),
+    )
     parser.add_argument("--telegram-note", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--telegram-note-only", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--telegram-only", action="store_true",
-                        help="fetch and publish URLs with no durable Kakera output")
+    parser.add_argument("--telegram-intake", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--local", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--tag", action="append", default=[], metavar="TAG",
                         help="add a Capture tag; may be repeated")
@@ -2706,7 +3056,7 @@ def main() -> int:
                         help="URL, or note selector for a note publishing command")
     arguments = parser.parse_args()
 
-    pseudo_names = {"local", "inbox", "todoist", "telegram", "telegram-only",
+    pseudo_names = {"local", "inbox", "todoist", "telegram", "telegram-only", "share",
                     "instagram-cookies", "twitter-cookies", "reddit-oauth"}
     note_mode = arguments.telegram_note or arguments.telegram_note_only
     if not note_mode and any(url in pseudo_names for url in arguments.urls):
@@ -2732,29 +3082,32 @@ def main() -> int:
         arguments.instagram_cookies is not None, arguments.twitter_cookies is not None,
         arguments.reddit_oauth is not None,
     )
-    if arguments.telegram and any(auth_options):
-        parser.error("--telegram cannot be combined with cookie export or Reddit OAuth")
-    if (arguments.telegram_only and (arguments.telegram or arguments.compose or arguments.local or
-                                      arguments.obsidian or arguments.inbox or arguments.todoist or
-                                      arguments.watch or arguments.interval or arguments.tag or
-                                      any(auth_options))):
-        parser.error("--telegram-only accepts URLs and source account options only")
+    share_telegram = arguments.share == "telegram"
+    share_telegram_only = arguments.share == "telegram-only"
+    if share_telegram and any(auth_options):
+        parser.error("--share telegram cannot be combined with cookie export or Reddit OAuth")
+    if (share_telegram_only and (share_telegram or arguments.compose or arguments.local or
+                                 arguments.obsidian or arguments.inbox or arguments.todoist or
+                                 arguments.watch or arguments.interval or arguments.tag or
+                                 arguments.telegram_intake or any(auth_options))):
+        parser.error("--share telegram-only accepts URLs and source account options only")
     if arguments.telegram_note or arguments.telegram_note_only:
         if not arguments.urls:
-            parser.error("telegram note publishing requires at least one note selector")
+            parser.error("share telegram note publishing requires at least one note selector")
         if (arguments.browser or arguments.account or arguments.twitter_account or
                 any(auth_options) or arguments.obsidian or arguments.inbox or arguments.watch or
-                arguments.todoist or arguments.compose or arguments.telegram or arguments.telegram_only or
+                arguments.todoist or arguments.compose or arguments.share or
+                arguments.telegram_intake or
                 arguments.local or arguments.tag or arguments.interval):
-            parser.error("telegram note publishing accepts selectors only")
+            parser.error("share telegram note publishing accepts selectors only")
         try:
             return (telegram_note_only_command(arguments.urls) if arguments.telegram_note_only
                     else telegram_command(arguments.urls))
         except (OSError, ValueError) as error:
             parser.error(str(error))
-    if arguments.telegram_only and not arguments.urls:
-        parser.error("--telegram-only requires at least one URL")
-    if arguments.telegram_only:
+    if share_telegram_only and not arguments.urls:
+        parser.error("--share telegram-only requires at least one URL")
+    if share_telegram_only:
         try:
             configured_telegram_chat_id()
             telegram_token()
@@ -2776,10 +3129,12 @@ def main() -> int:
             print(f"{'ok' if success else 'error'}: {url}: {message}")
             failed |= not success
         return int(failed)
-    if arguments.telegram:
+    if share_telegram:
         cli_tags = merge_tags(cli_tags, [TELEGRAM_TAG])
     if arguments.interval is not None and not arguments.watch:
         parser.error("--interval requires --watch")
+    if arguments.telegram_intake and arguments.interval is not None:
+        parser.error("--interval cannot be used with telegram")
 
     if arguments.instagram_cookies is not None:
         if arguments.urls:
@@ -2808,6 +3163,24 @@ def main() -> int:
         except (EOFError, OSError, ValueError) as error:
             parser.error(str(error))
 
+    if arguments.telegram_intake:
+        if arguments.urls:
+            parser.error("telegram does not accept URLs")
+        if (arguments.share or arguments.compose or arguments.local or arguments.obsidian or
+                arguments.inbox or arguments.todoist or arguments.tag or any(auth_options)):
+            parser.error("telegram accepts --watch and source account options only")
+        try:
+            browser = arguments.browser or configured_browser()
+            account = account_name(arguments.account) if arguments.account else (
+                None if arguments.browser else configured_instagram_account()
+            )
+            twitter_account = account_name(arguments.twitter_account) if arguments.twitter_account else (
+                None if arguments.browser else configured_twitter_account()
+            )
+            return telegram_intake(browser, account, twitter_account, watch=arguments.watch)
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+
     try:
         browser = arguments.browser or configured_browser()
         explicit_account = account_name(arguments.account) if arguments.account else None
@@ -2820,7 +3193,7 @@ def main() -> int:
         twitter_account = explicit_twitter_account or (
             None if arguments.browser else configured_twitter_account()
         )
-        notes, attachments = configured_folders() if not arguments.local and (arguments.obsidian or arguments.inbox or arguments.todoist or arguments.telegram) else (
+        notes, attachments = configured_folders() if not arguments.local and (arguments.obsidian or arguments.inbox or arguments.todoist or share_telegram) else (
             ROOT / "downloads",
             ROOT / "attachments",
         )
@@ -2866,7 +3239,7 @@ def main() -> int:
         except (OSError, ValueError) as error:
             parser.error(str(error))
     if arguments.watch:
-        parser.error("--watch requires --inbox or --todoist")
+        parser.error("--watch requires --inbox, --todoist, or telegram")
     if not arguments.urls:
         parser.error("provide at least one URL")
 
