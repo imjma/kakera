@@ -1,0 +1,63 @@
+name: kakera
+
+x-kakera-environment: &kakera-environment
+  HOME: /state
+  KAKERA_CONFIG: /config/kakera.json
+  KAKERA_TELEGRAM_STATE: /state/kakera.telegram-state.json
+  PYTHONDONTWRITEBYTECODE: "1"
+  TMPDIR: /state/tmp
+  TZ: ${TZ:-Australia/Sydney}
+
+x-kakera: &kakera
+  image: kakera:local
+  user: "${PUID:?Set PUID in .env}:${PGID:?Set PGID in .env}"
+  init: true
+  read_only: true
+  restart: unless-stopped
+  profiles: [workers]
+  depends_on:
+    obsidian:
+      condition: service_started
+  volumes:
+    - ./config:/config
+    - ./.cookies:/app/.cookies:ro
+    - ./state:/state
+    - "${VAULT_PATH:?Set VAULT_PATH in .env}:/vault"
+
+services:
+  obsidian:
+    build:
+      context: .
+      dockerfile: Dockerfile.obsidian
+    image: kakera-obsidian:0.0.14
+    user: "${PUID:?Set PUID in .env}:${PGID:?Set PGID in .env}"
+    init: true
+    read_only: true
+    restart: unless-stopped
+    environment:
+      HOME: /config
+      TZ: ${TZ:-Australia/Sydney}
+      XDG_CONFIG_HOME: /config
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./obsidian-config:/config
+      - "${VAULT_PATH:?Set VAULT_PATH in .env}:/vault"
+
+  todoist:
+    <<: *kakera
+    build:
+      context: ../..
+      dockerfile: deploy/synology/Dockerfile.kakera
+    command: ["--todoist", "--watch"]
+    environment:
+      <<: *kakera-environment
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in .env}
+      TODOIST_API_TOKEN: ${TODOIST_API_TOKEN:?Set TODOIST_API_TOKEN in .env}
+
+  telegram:
+    <<: *kakera
+    command: ["--telegram-intake", "--watch"]
+    environment:
+      <<: *kakera-environment
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in .env}
