@@ -1,0 +1,8 @@
+FROM python:3.13-slim-bookworm
+
+RUN pip install --no-cache-dir "gallery-dl>=1.32.9,<2"
+
+WORKDIR /app
+COPY kakera.py .
+
+ENTRYPOINT ["python", "/app/kakera.py"]

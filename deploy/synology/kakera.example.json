@@ -1,0 +1,24 @@
+{
+  "browser": null,
+  "instagram": {
+    "account": "YOUR_INSTAGRAM_COOKIE_ALIAS"
+  },
+  "twitter": {
+    "account": "YOUR_TWITTER_COOKIE_ALIAS"
+  },
+  "obsidian": {
+    "vault": "/vault",
+    "notes": "kakera",
+    "attachments": "attachments",
+    "inbox": "kakera/inbox.md",
+    "interval": "2s"
+  },
+  "todoist": {
+    "project_id": "YOUR_TODOIST_PROJECT_ID",
+    "interval": "3m"
+  },
+  "telegram": {
+    "chat_id": "-1001234567890",
+    "allowed_user_ids": [123456789]
+  }
+}

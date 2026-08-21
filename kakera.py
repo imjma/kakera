@@ -27,7 +27,7 @@ from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parent
-CONFIG = ROOT / "kakera.json"
+CONFIG = Path(os.environ.get("KAKERA_CONFIG", ROOT / "kakera.json"))
 COOKIE_DIR = ROOT / ".cookies"
 VERSION = "0.1.0"
 REDDIT_CLIENT_ID = "6N9uN0krSDE-ig"
@@ -53,7 +53,9 @@ TELEGRAM_API = "https://api.telegram.org"
 TELEGRAM_RECEIPT = "kakera"
 TELEGRAM_TAG = "share/telegram"
 TELEGRAM_ONLY_TAG = "share/telegram-only"
-TELEGRAM_STATE = ROOT / "kakera.telegram-state.json"
+TELEGRAM_STATE = Path(os.environ.get(
+    "KAKERA_TELEGRAM_STATE", ROOT / "kakera.telegram-state.json"
+))
 TELEGRAM_LONG_POLL = 60
 TELEGRAM_MAX_IMAGES = 10
 TELEGRAM_MAX_BYTES = 10 * 1024 * 1024

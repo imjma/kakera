@@ -53,6 +53,12 @@ ln -s "$PWD/kakera" ~/.local/bin/kakera
 
 Add `~/.local/bin` to `PATH` if necessary.
 
+## Synology NAS
+
+For a persistent Synology Container Manager deployment running Todoist watch,
+Telegram Intake watch, and official Obsidian Headless Sync, follow the
+[Synology NAS runbook](docs/synology.md).
+
 ## Commands
 
 URL capture modes accept multiple URL arguments. `--share telegram-only` also

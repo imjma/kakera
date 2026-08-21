@@ -1,0 +1,5 @@
+.cookies/
+.env
+config/
+obsidian-config/
+state/
