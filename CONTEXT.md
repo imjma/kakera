@@ -41,7 +41,7 @@ Any Submitted Source after the Primary Source. If it resolves to a Source Post, 
 _Avoid_: Secondary capture
 
 **Failed Source**:
-A Submitted Source that could not be verified or supplied no supported image. Its URL and failure reason are written in the Source Note body; it is not called a Source Post. A composition is saved when another Source Post supplies at least one image.
+A Submitted Source that could not be verified or supplied no supported image. Its URL and failure reason are written in the Source Note body; it is not called a Source Post. A composition is saved when another Source Post supplies at least one image. An Instagram login wall is an expired session; a followers-only Instagram post is followers-only.
 _Avoid_: Ignored URL, skipped source
 
 **Source Note**:
@@ -57,15 +57,15 @@ An image referenced by a Source Note and stored under its Source Service in the 
 _Avoid_: Asset, media file, downloaded image
 
 **Inbox**:
-An Obsidian note containing unchecked Markdown tasks whose URLs are waiting to become Captures, or Transient Telegram Deliveries when requested with `share/telegram-only`. A parent task and nested subtasks may form one ordered composition. Successful groups are checked; unsuccessful groups remain pending.
+An Obsidian note containing unchecked Markdown tasks whose URLs are waiting to become Captures, or Transient Telegram Deliveries when requested with `share/telegram-only`. A parent task and nested subtasks may form one ordered composition. Successful groups are checked; unsuccessful groups remain pending. An expired Instagram session or followers-only Instagram post is reported in one configured allowed user's private chat even when the group is saved; other unsuccessful groups are reported there only while they remain pending.
 _Avoid_: Queue database, link file, Todoist
 
 **Todoist**:
-An external project of open tasks whose URLs are waiting to become Captures, or Transient Telegram Deliveries when requested with `share/telegram-only`, the same role as the Inbox. A parent task and nested subtasks may form one ordered composition; native labels become Capture Tags except `share/telegram-only`, which is a queue request and is not persisted.
+An external project of open tasks whose URLs are waiting to become Captures, or Transient Telegram Deliveries when requested with `share/telegram-only`, the same role as the Inbox. A parent task and nested subtasks may form one ordered composition; native labels become Capture Tags except `share/telegram-only`, which is a queue request and is not persisted. Unsuccessful groups remain open. An expired Instagram session or followers-only Instagram post is reported in one configured allowed user's private chat even when the group is saved; other unsuccessful groups are reported there only while they remain open.
 _Avoid_: Inbox, queue label
 
 **Telegram Intake**:
-Private Telegram messages to the bot from allowed users. A recognized Source Service URL in the message text or caption is a Submitted Source for a Transient Telegram Delivery to the configured chat. Only a new private message is a submission; an edit of a consumed message is not. Each consumed message is finished; it is not left pending and is not retried. Success is the Delivery in the configured chat; that Delivery names the sender by Telegram username, or display name when they have no username, not by user ID. A failed Delivery is reported in the private chat.
+Private Telegram messages to the bot from allowed users. A recognized Source Service URL in the message text or caption is a Submitted Source for a Transient Telegram Delivery to the configured chat. Only a new private message is a submission; an edit of a consumed message is not. Each consumed message is finished; it is not left pending and is not retried. Success is the Delivery in the configured chat; that Delivery names the sender by Telegram username, or display name when they have no username, not by user ID. A failed Delivery is reported in the sender's private chat with the failure reason.
 _Avoid_: telegram-bot, Telegram Inbox, Telegram queue, Telegram post
 
 **Source Service**:

@@ -10,6 +10,9 @@ x-kakera-environment: &kakera-environment
 
 x-kakera: &kakera
   image: kakera:local
+  build:
+    context: ../..
+    dockerfile: deploy/synology/Dockerfile.kakera
   user: "${PUID:?Set PUID in .env}:${PGID:?Set PGID in .env}"
   init: true
   read_only: true
@@ -46,9 +49,6 @@ services:
 
   todoist:
     <<: *kakera
-    build:
-      context: ../..
-      dockerfile: deploy/synology/Dockerfile.kakera
     command: ["--todoist", "--watch"]
     environment:
       <<: *kakera-environment

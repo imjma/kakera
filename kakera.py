@@ -53,6 +53,8 @@ TELEGRAM_API = "https://api.telegram.org"
 TELEGRAM_RECEIPT = "kakera"
 TELEGRAM_TAG = "share/telegram"
 TELEGRAM_ONLY_TAG = "share/telegram-only"
+INSTAGRAM_SESSION_EXPIRED = "Instagram session expired"
+INSTAGRAM_FOLLOWERS_ONLY = "Instagram post is followers-only"
 TELEGRAM_STATE = Path(os.environ.get(
     "KAKERA_TELEGRAM_STATE", ROOT / "kakera.telegram-state.json"
 ))
@@ -587,6 +589,21 @@ def configured_telegram_allowed_user_ids() -> list[int]:
     return ids
 
 
+def configured_telegram_report_user_id() -> int | None:
+    telegram = read_config().get("telegram")
+    if not isinstance(telegram, dict) or telegram.get("report_user_id") is None:
+        return None
+    try:
+        user_id = canonical_telegram_user_id(telegram.get("report_user_id"))
+    except ValueError as error:
+        raise ValueError(f"invalid {CONFIG.name}: telegram.report_user_id must be numeric") from error
+    if user_id not in configured_telegram_allowed_user_ids():
+        raise ValueError(
+            f"invalid {CONFIG.name}: telegram.report_user_id must be listed in telegram.allowed_user_ids"
+        )
+    return user_id
+
+
 def source_service_urls(text: str) -> list[str]:
     found = []
     for match in HTTP_URL.finditer(text):
@@ -687,6 +704,80 @@ def telegram_get_updates(token: str, offset: int | None, timeout: int) -> list[d
 
 def telegram_send_text(chat_id: str, text: str, token: str) -> None:
     telegram_json("sendMessage", token, {"chat_id": chat_id, "text": text[:4096]})
+
+
+def instagram_named_error(text: str | None) -> str | None:
+    if not isinstance(text, str):
+        return None
+    if INSTAGRAM_FOLLOWERS_ONLY in text:
+        return INSTAGRAM_FOLLOWERS_ONLY
+    if INSTAGRAM_SESSION_EXPIRED in text:
+        return INSTAGRAM_SESSION_EXPIRED
+    return None
+
+
+def instagram_fetch_error(stderr: str) -> str | None:
+    folded = stderr.casefold()
+    if "posts are private" in folded or "post is private" in folded:
+        return INSTAGRAM_FOLLOWERS_ONLY
+    if "[instagram]" in folded and "login page" in folded:
+        return INSTAGRAM_SESSION_EXPIRED
+    return None
+
+
+def format_named_instagram(named: dict[str, list[str]]) -> str:
+    parts = []
+    for reason in (INSTAGRAM_SESSION_EXPIRED, INSTAGRAM_FOLLOWERS_ONLY):
+        urls = named.get(reason)
+        if urls:
+            parts.append(f"{reason}: {', '.join(published_url(url) for url in urls)}")
+    return "; ".join(parts)
+
+
+def report_named_instagram_failures(
+    origin: str,
+    named: dict[str, list[str]],
+    reported: dict | None,
+) -> None:
+    for reason in (INSTAGRAM_SESSION_EXPIRED, INSTAGRAM_FOLLOWERS_ONLY):
+        urls = list(dict.fromkeys(published_url(url) for url in named.get(reason, [])))
+        if not urls:
+            if reported is not None:
+                reported.pop(("instagram", reason), None)
+            continue
+        report_queue_failure(
+            origin,
+            reason + "\n" + "\n".join(urls),
+            key=("instagram", reason),
+            reported=reported,
+        )
+
+
+def report_queue_failure(
+    origin: str,
+    detail: str,
+    *,
+    key: object = None,
+    reported: dict | None = None,
+) -> None:
+    if reported is not None and key is not None and reported.get(key) == detail:
+        return
+    try:
+        token = telegram_token()
+        user_id = configured_telegram_report_user_id()
+    except ValueError as error:
+        if str(error) != "TELEGRAM_BOT_TOKEN is not set":
+            stamp_print(f"error: {error}", error=True)
+        return
+    if user_id is None:
+        return
+    try:
+        telegram_send_text(str(user_id), f"{origin}: {detail}", token)
+    except ValueError as error:
+        stamp_print(f"error: cannot report in Telegram: {error}", error=True)
+        return
+    if reported is not None and key is not None:
+        reported[key] = detail
 
 
 @contextmanager
@@ -975,10 +1066,12 @@ def process_todoist(
     account: str | None = None,
     twitter_account: str | None = None,
     tags: list[str] | None = None,
+    reported: dict | None = None,
 ) -> int:
     token = todoist_token()
     project_id = configured_todoist_project()
     failed = False
+    named: dict[str, list[str]] = {}
     pages = todoist_task_pages(token, project_id)
     first_page = next(pages, [])
     hierarchy = any("parent_id" in task for task in first_page)
@@ -1021,7 +1114,10 @@ def process_todoist(
         item_tags = queue_tags(list(tree_tags(task))) if hierarchy else queue_tags(task_tags(task))
         capture_tags = merge_tags(item_tags, tags or [])
         if telegram_only_requested(capture_tags):
-            if not process_transient_urls(urls, browser, account, twitter_account):
+            if not process_transient_urls(
+                urls, browser, account, twitter_account,
+                origin="Todoist", reported=reported, named_failures=named,
+            ):
                 failed = True
                 continue
             try:
@@ -1029,30 +1125,49 @@ def process_todoist(
             except ValueError as error:
                 print(f"{process_stamp()} error: Todoist task {task.get('id', '?')} was sent but not closed: {error}", file=sys.stderr)
                 failed = True
+                report_queue_failure(
+                    "Todoist",
+                    f"task {task.get('id', '?')} was sent but not closed: {error}",
+                    key=("close", str(task.get("id", ""))),
+                    reported=reported,
+                )
+                continue
+            if reported is not None:
+                reported.pop(("close", str(task.get("id", ""))), None)
             continue
-        if len(urls) > 1:
-            success, message = (
-                save_composed(urls, browser, notes, attachments, account, twitter_account,
-                              capture_tags)
-                if capture_tags else
-                save_composed(urls, browser, notes, attachments, account, twitter_account)
-            )
-        else:
-            success, message = (
-                save(urls[0], browser, notes, attachments, account, twitter_account,
-                     capture_tags)
-                if capture_tags else
-                save(urls[0], browser, notes, attachments, account, twitter_account)
-            )
+        success, message = save_composed(
+            urls, browser, notes, attachments, account, twitter_account,
+            capture_tags or None, named_failures=named,
+        )
         print(f"{process_stamp()} {'ok' if success else 'error'}: {', '.join(urls)}: {message}")
+        capture_key = ("capture", tuple(urls))
         if not success:
             failed = True
+            if instagram_named_error(message) is None or "no sources produced" in message:
+                report_queue_failure(
+                    "Todoist",
+                    f"{', '.join(published_url(url) for url in urls)}: {message}",
+                    key=capture_key,
+                    reported=reported,
+                )
             continue
+        if reported is not None:
+            reported.pop(capture_key, None)
         try:
             todoist_request(token, f"/tasks/{quote(str(task.get('id', '')), safe='')}/close", "POST")
         except ValueError as error:
             print(f"{process_stamp()} error: Todoist task {task.get('id', '?')} was saved but not closed: {error}", file=sys.stderr)
             failed = True
+            report_queue_failure(
+                "Todoist",
+                f"task {task.get('id', '?')} was saved but not closed: {error}",
+                key=("close", str(task.get("id", ""))),
+                reported=reported,
+            )
+            continue
+        if reported is not None:
+            reported.pop(("close", str(task.get("id", ""))), None)
+    report_named_instagram_failures("Todoist", named, reported)
     return int(failed)
 
 
@@ -1066,12 +1181,19 @@ def watch_todoist(
     tags: list[str] | None = None,
 ) -> int:
     stamp_print("ok: watching Todoist")
+    reported: dict = {}
     try:
         while True:
             try:
-                process_todoist(browser, notes, attachments, account, twitter_account, tags)
+                process_todoist(
+                    browser, notes, attachments, account, twitter_account, tags,
+                    reported=reported,
+                )
             except (OSError, ValueError) as error:
                 stamp_print(f"error: {error}", error=True)
+                report_queue_failure("Todoist", str(error), key="watch", reported=reported)
+            else:
+                reported.pop("watch", None)
             time.sleep(interval)
     except KeyboardInterrupt:
         stamp_print("ok: stopped watching Todoist")
@@ -2337,11 +2459,30 @@ def process_transient_urls(
     browser: str | None,
     account: str | None,
     twitter_account: str | None,
+    *,
+    origin: str = "",
+    reported: dict | None = None,
+    named_failures: dict | None = None,
 ) -> bool:
     failed = False
     for url in urls:
         success, message = telegram_only_url(url, browser, account, twitter_account)
         print(f"{process_stamp()} {'ok' if success else 'error'}: {url}: {message}")
+        capture_key = ("capture", (url,))
+        if success:
+            if reported is not None:
+                reported.pop(capture_key, None)
+            continue
+        reason = instagram_named_error(message)
+        if reason and named_failures is not None:
+            named_failures.setdefault(reason, []).append(url)
+        elif origin:
+            report_queue_failure(
+                origin,
+                f"{published_url(url)}: {message}",
+                key=capture_key,
+                reported=reported,
+            )
         failed |= not success
     return not failed
 
@@ -2460,16 +2601,10 @@ def fetch_source(
         command.append(normalized_url)
         result = subprocess.run(command, capture_output=True, text=True)
     if result and result.returncode:
-        error = next((line for line in reversed(result.stderr.splitlines()) if line.strip()), "download failed")
-        if "[instagram]" in error and "login page" in error:
-            if account:
-                error = (f"Instagram rejected saved account {account!r}; switch to it in "
-                         f"Orion and run kakera instagram-cookies {account} again")
-            elif browser:
-                error = f"Instagram rejected the {browser} browser session; sign in there and retry"
-            else:
-                error = "Instagram requires a logged-in browser session; retry with --browser safari"
-        elif "[reddit]" in error:
+        error = instagram_fetch_error(result.stderr or "")
+        if not error:
+            error = next((line for line in reversed(result.stderr.splitlines()) if line.strip()), "download failed")
+        if error not in {INSTAGRAM_SESSION_EXPIRED, INSTAGRAM_FOLLOWERS_ONLY} and "[reddit]" in error:
             try:
                 configured = configured_reddit()
             except ValueError:
@@ -2685,14 +2820,21 @@ def save_composed(
     notes: Path = ROOT / "downloads", attachment_root: Path = ROOT / "attachments",
     account: str | None = None, twitter_account: str | None = None,
     tags: list[str] | None = None,
+    named_failures: dict | None = None,
 ) -> tuple[bool, str]:
     unique = dedupe_urls(urls)
     if not unique:
         return False, "provide at least one URL"
     if len(unique) == 1:
-        if tags:
-            return save(unique[0], browser, notes, attachment_root, account, twitter_account, tags)
-        return save(unique[0], browser, notes, attachment_root, account, twitter_account)
+        success, message = (
+            save(unique[0], browser, notes, attachment_root, account, twitter_account, tags)
+            if tags else
+            save(unique[0], browser, notes, attachment_root, account, twitter_account)
+        )
+        reason = instagram_named_error(message)
+        if reason and named_failures is not None:
+            named_failures.setdefault(reason, []).append(unique[0])
+        return success, message
     with tempfile.TemporaryDirectory(prefix="kakera-compose-") as directory:
         sources = []
         for index, url in enumerate(unique):
@@ -2717,8 +2859,22 @@ def save_composed(
                                 "metadata": metadata, "error": error})
             else:
                 sources.append(source)
+        found: dict[str, list[str]] = {}
+        for source in sources:
+            reason = instagram_named_error(source.get("error"))
+            if reason:
+                found.setdefault(reason, []).append(source["url"])
+        if named_failures is not None:
+            for reason, urls in found.items():
+                named_failures.setdefault(reason, []).extend(urls)
         successful = [source for source in sources if source.get("valid")]
         if not successful:
+            named_text = format_named_instagram(found)
+            unnamed = sum(1 for source in sources if not instagram_named_error(source.get("error")))
+            if named_text and not unnamed:
+                return False, named_text
+            if named_text:
+                return False, f"no sources produced supported images; {named_text}"
             return False, "no sources produced supported images"
         try:
             for source in successful:
@@ -2753,7 +2909,13 @@ def save_composed(
         except (OSError, ValueError) as error:
             return False, f"cannot save composition: {error}"
         failures = sum(1 for source in sources if source.get("error"))
-        suffix = f"; {failures} source(s) failed" if failures else ""
+        named_text = format_named_instagram(found)
+        bits = []
+        if failures:
+            bits.append(f"{failures} source(s) failed")
+        if named_text:
+            bits.append(named_text)
+        suffix = ("; " + "; ".join(bits)) if bits else ""
         return True, f"saved {sum(len(source['images']) for source in successful)} image(s){suffix}{delivery_suffix if telegram_requested(tags) else ''}"
 
 
@@ -2767,6 +2929,7 @@ def process_inbox(
     report_empty: bool = True,
     twitter_account: str | None = None,
     tags: list[str] | None = None,
+    reported: dict | None = None,
 ) -> int:
     if not inbox.exists():
         inbox.parent.mkdir(parents=True, exist_ok=True)
@@ -2776,6 +2939,7 @@ def process_inbox(
 
     completed = completed if completed is not None else set()
     failed = False
+    named: dict[str, list[str]] = {}
     attempted: set[tuple] = set()
     groups = pending_inbox_groups(inbox)
     if not groups and report_empty:
@@ -2790,41 +2954,69 @@ def process_inbox(
         if signature in completed:
             if not mark_completed_signature(inbox, signature):
                 completed.remove(signature)
+                if reported is not None:
+                    reported.pop(("close", signature), None)
             else:
                 failed = True
+                report_queue_failure(
+                    "Inbox",
+                    f"captured but not checked in {inbox}",
+                    key=("close", signature),
+                    reported=reported,
+                )
             continue
         urls = group["urls"]
         capture_tags = merge_tags(group.get("tags", []), tags or [])
+        capture_key = ("capture", tuple(urls))
         if telegram_only_requested(capture_tags):
-            success = process_transient_urls(urls, browser, account, twitter_account)
+            success = process_transient_urls(
+                urls, browser, account, twitter_account,
+                origin="Inbox", reported=reported, named_failures=named,
+            )
             if success:
                 completion_failed = mark_completed_signature(inbox, signature)
                 failed |= completion_failed
                 if completion_failed:
                     completed.add(signature)
+                    report_queue_failure(
+                        "Inbox",
+                        f"captured but not checked in {inbox}",
+                        key=("close", signature),
+                        reported=reported,
+                    )
+                elif reported is not None:
+                    reported.pop(("close", signature), None)
             failed |= not success
             continue
-        if len(urls) > 1:
-            success, message = (
-                save_composed(urls, browser, notes, attachments, account, twitter_account,
-                              capture_tags)
-                if capture_tags else
-                save_composed(urls, browser, notes, attachments, account, twitter_account)
-            )
-        else:
-            success, message = (
-                save(urls[0], browser, notes, attachments, account, twitter_account,
-                     capture_tags)
-                if capture_tags else
-                save(urls[0], browser, notes, attachments, account, twitter_account)
-            )
+        success, message = save_composed(
+            urls, browser, notes, attachments, account, twitter_account,
+            capture_tags or None, named_failures=named,
+        )
         print(f"{process_stamp()} {'ok' if success else 'error'}: {', '.join(urls)}: {message}")
         if success:
+            if reported is not None:
+                reported.pop(capture_key, None)
             completion_failed = mark_completed_signature(inbox, signature)
             failed |= completion_failed
             if completion_failed:
                 completed.add(signature)
+                report_queue_failure(
+                    "Inbox",
+                    f"captured but not checked in {inbox}",
+                    key=("close", signature),
+                    reported=reported,
+                )
+            elif reported is not None:
+                reported.pop(("close", signature), None)
+        elif instagram_named_error(message) is None or "no sources produced" in message:
+            report_queue_failure(
+                "Inbox",
+                f"{', '.join(published_url(url) for url in urls)}: {message}",
+                key=capture_key,
+                reported=reported,
+            )
         failed |= not success
+    report_named_instagram_failures("Inbox", named, reported)
     return int(failed)
 
 
@@ -2986,8 +3178,12 @@ def watch_inbox(
     tags: list[str] | None = None,
 ) -> int:
     completed: set[str] = set()
+    reported: dict = {}
     if not inbox.exists():
-        process_inbox(inbox, browser, notes, attachments, account, completed, False, twitter_account, tags)
+        process_inbox(
+            inbox, browser, notes, attachments, account, completed, False, twitter_account, tags,
+            reported=reported,
+        )
     previous: object = object()
     reported_error = None
     stamp_print(f"ok: watching {inbox}")
@@ -2999,13 +3195,18 @@ def watch_inbox(
                 else:
                     current = read_inbox(inbox)
                     if current != previous or completed:
-                        process_inbox(inbox, browser, notes, attachments, account, completed, False, twitter_account, tags)
+                        process_inbox(
+                            inbox, browser, notes, attachments, account, completed, False,
+                            twitter_account, tags, reported=reported,
+                        )
                     previous = read_inbox(inbox)
                 reported_error = None
+                reported.pop("watch", None)
             except (OSError, ValueError) as error:
                 if str(error) != reported_error:
                     stamp_print(f"error: {error}", error=True)
                     reported_error = str(error)
+                report_queue_failure("Inbox", str(error), key="watch", reported=reported)
             time.sleep(interval)
     except KeyboardInterrupt:
         stamp_print("ok: stopped watching inbox")

@@ -214,7 +214,8 @@ Start with this base configuration:
   },
   "telegram": {
     "chat_id": "-1001234567890",
-    "allowed_user_ids": [123456789]
+    "allowed_user_ids": [123456789],
+    "report_user_id": 123456789
   }
 }
 ```
@@ -237,6 +238,9 @@ long-polls and rejects `--interval`.
 `telegram.allowed_user_ids` is required for `kakera telegram`. It is a non-empty
 array of numeric Telegram user IDs whose private messages may become Transient
 Telegram Deliveries. Missing, empty, or non-numeric values refuse to start.
+`telegram.report_user_id` is the one allowed user who receives Inbox and Todoist
+capture-failure reports in private chat. It must be listed in
+`allowed_user_ids`. Omit it to skip those reports.
 
 `obsidian.vault` is the existing vault directory; `~` is expanded. `notes`,
 `attachments`, and `inbox` are paths relative to that vault: they are the
@@ -359,6 +363,16 @@ Post title - Instagram
 https://www.instagram.com/p/ABC/
 from @imjma
 ```
+
+Inbox and Todoist capture failures are reported in the private chat of
+`telegram.report_user_id`. The queue watcher sends that text itself; it does
+not go through `kakera telegram --watch`, and a second Intake watcher is still
+refused. Identical failures are not re-reported until the reason changes or a
+later capture succeeds. Missing `report_user_id` or Telegram configuration
+skips the report without changing capture behavior. Named Instagram Failed
+Sources (`Instagram session expired` and `Instagram post is followers-only`)
+are one report per class per poll, even when another source in the group
+saved; Intake replies to the sender with the same reason.
 
 The last consumed Telegram `update_id` is stored in `kakera.telegram-state.json`
 next to `kakera.json` (gitignored). A second `kakera telegram --watch` fails
@@ -532,6 +546,7 @@ Inbox/Todoist/watch, or fetch remote images embedded in an existing note.
 | `TELEGRAM_BOT_TOKEN is not set` | Export the token in the shell running Kakera; never add it to JSON. |
 | Invalid `telegram.chat_id` | Use the exact numeric ID from `getUpdates`, including its minus sign; no `@username` or topic ID. |
 | Invalid `telegram.allowed_user_ids` | Non-empty array of numeric user IDs; required for `kakera telegram`. A private-chat ID from the snippet above is the user ID. |
+| Invalid `telegram.report_user_id` | A single numeric user ID listed in `allowed_user_ids`; omit the key to skip Inbox/Todoist failure reports. |
 | Bot cannot send | Recheck channel **Post Messages** or group send-message/send-photo permissions. |
 | `getUpdates` is empty | Send a fresh group/channel event or DM; check whether another consumer or webhook has consumed updates. |
 | `Telegram webhook is set` | Delete the webhook on this bot token; Intake uses `getUpdates` only. |
@@ -610,8 +625,11 @@ only after at least one image is saved.
 Todoist captures are written to the configured `obsidian.notes` and
 `obsidian.attachments` folders. Tasks without a URL remain open; a composition
 with at least one saved image closes its root task even if another source
-failed. If no image is saved, the task remains open. `--watch` polls every 3
-minutes. Override with `--interval` or `todoist.interval`. Native Todoist labels on the parent and nested subtasks become
+failed. If no image is saved, the task remains open and, when
+`telegram.report_user_id` is set, the failure is reported in that user's
+private chat.
+`--watch` polls every 3 minutes. Override with `--interval` or
+`todoist.interval`. Native Todoist labels on the parent and nested subtasks become
 Capture Tags in the same depth-first order as their URLs. Add `--tag` for
 invocation-wide tags, including watch mode; hashtags typed in Todoist text are
 not interpreted as labels.
@@ -647,8 +665,10 @@ URLs and inline hashtags are collected from the parent first, then from nested
 tasks depth-first; the URL `#photo` fragment above is ignored as a tag. The
 resulting tag order is `research`, `first`, `second`. Successful groups check
 the parent and its subtasks. Failed sources are recorded in the Source Note; if
-no image is saved, the group remains unchecked. `--watch`
-rechecks the file every 2 seconds and stops with Ctrl-C. Override with
+no image is saved, the group remains unchecked and, when
+`telegram.report_user_id` is set, the failure is reported in that user's
+private chat.
+`--watch` rechecks the file every 2 seconds and stops with Ctrl-C. Override with
 `--interval` or `obsidian.interval`. Add `--tag` to apply
 an invocation-wide tag to every group, including later groups processed by
 watch mode.

@@ -512,9 +512,39 @@ with TemporaryDirectory() as directory:
         [], 1, "", "[instagram][error] HTTP redirect to login page (https://www.instagram.com/accounts/login/)"
     )
     with patch.object(kakera.subprocess, "run", return_value=login_error):
-        assert kakera.save(url, None, root / "downloads", root / "attachments")[1].endswith(
-            "retry with --browser safari"
+        assert kakera.save(url, None, root / "downloads", root / "attachments") == (
+            False, kakera.INSTAGRAM_SESSION_EXPIRED
         )
+    private_error = CompletedProcess(
+        [], 1, "", "[instagram][warning] artist's posts are private\n[instagram][error] AbortExtraction"
+    )
+    with patch.object(kakera.subprocess, "run", return_value=private_error):
+        assert kakera.save(url, None, root / "downloads", root / "attachments") == (
+            False, kakera.INSTAGRAM_FOLLOWERS_ONLY
+        )
+
+    def fake_mixed(command, **_):
+        submitted = command[-1]
+        if "instagram" in submitted:
+            return CompletedProcess(
+                command, 1, "",
+                "[instagram][error] HTTP redirect to login page (https://www.instagram.com/accounts/login/)",
+            )
+        target = Path(command[command.index("--directory") + 1]) / "tweet.jpg"
+        target.write_bytes(b"\xff\xd8\xff\xe0image")
+        target.with_suffix(".jpg.json").write_text(json.dumps({
+            "content": "hello", "author": {"name": "a", "nick": "A"},
+        }))
+        return CompletedProcess(command, 0, str(target), "")
+
+    named = {}
+    with patch.object(kakera.subprocess, "run", side_effect=fake_mixed):
+        success, message = kakera.save_composed(
+            ["https://x.com/a/status/1", "https://www.instagram.com/p/ABC_123/"],
+            None, root / "downloads", root / "attachments", named_failures=named,
+        )
+    assert success and kakera.INSTAGRAM_SESSION_EXPIRED in message
+    assert named[kakera.INSTAGRAM_SESSION_EXPIRED] == ["https://www.instagram.com/p/ABC_123/"]
 
 with TemporaryDirectory() as directory:
     root = Path(directory)
@@ -3043,10 +3073,20 @@ with TemporaryDirectory() as directory:
     state = root / "kakera.telegram-state.json"
     config = root / "kakera.json"
     config.write_text(json.dumps({
-        "telegram": {"chat_id": "-1001", "allowed_user_ids": [42, "42", "43"]},
+        "telegram": {
+            "chat_id": "-1001",
+            "allowed_user_ids": [42, "42", "43"],
+            "report_user_id": "43",
+        },
     }))
     with patch.object(kakera, "CONFIG", config):
         assert kakera.configured_telegram_allowed_user_ids() == [42, 43]
+        assert kakera.configured_telegram_report_user_id() == 43
+    config.write_text(json.dumps({
+        "telegram": {"chat_id": "-1001", "allowed_user_ids": [42, 43]},
+    }))
+    with patch.object(kakera, "CONFIG", config):
+        assert kakera.configured_telegram_report_user_id() is None
     for payload in (
         {"telegram": {"chat_id": "-1001"}},
         {"telegram": {"chat_id": "-1001", "allowed_user_ids": []}},
@@ -3061,6 +3101,20 @@ with TemporaryDirectory() as directory:
                 pass
             else:
                 raise AssertionError(f"accepted invalid allowlist {payload!r}")
+    for payload in (
+        {"telegram": {"chat_id": "-1001", "allowed_user_ids": [42], "report_user_id": 0}},
+        {"telegram": {"chat_id": "-1001", "allowed_user_ids": [42], "report_user_id": "x"}},
+        {"telegram": {"chat_id": "-1001", "allowed_user_ids": [42], "report_user_id": 99}},
+        {"telegram": {"chat_id": "-1001", "report_user_id": 42}},
+    ):
+        config.write_text(json.dumps(payload))
+        with patch.object(kakera, "CONFIG", config):
+            try:
+                kakera.configured_telegram_report_user_id()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"accepted invalid report_user_id {payload!r}")
 
     config.write_text(json.dumps({
         "telegram": {"chat_id": "-1001", "allowed_user_ids": [42]},
@@ -3109,6 +3163,25 @@ with TemporaryDirectory() as directory:
     assert replies and replies[0][0] == "42" and twitter in replies[0][1] and instagram not in replies[0][1]
     assert json.loads(state.read_text()) == {"update_id": 16}
     assert seen_offsets[0] == (None, 0) and seen_offsets[1][0] == 17
+
+    classified_replies = []
+    classified_dm = {
+        "update_id": 17,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "is_bot": False, "username": "imjma"},
+            "text": instagram,
+        },
+    }
+    with (
+        patch.object(kakera, "telegram_only_url", return_value=(
+            False, f"Telegram not sent: {kakera.INSTAGRAM_SESSION_EXPIRED}",
+        )),
+        patch.object(kakera, "telegram_send_text", side_effect=lambda *args: classified_replies.append(args)),
+    ):
+        assert kakera.process_intake_update(classified_dm, {42}, "secret", None, None, None)
+    assert classified_replies[0][0] == "42"
+    assert kakera.INSTAGRAM_SESSION_EXPIRED in classified_replies[0][1]
 
     with (
         patch.object(kakera, "CONFIG", config),
@@ -3181,3 +3254,250 @@ with TemporaryDirectory() as directory:
             assert error.code == 2
         else:
             raise AssertionError("accepted telegram intake without allowlist")
+
+
+with TemporaryDirectory() as directory:
+    root = Path(directory)
+    notes, attachments = root / "notes", root / "attachments"
+    notes.mkdir()
+    attachments.mkdir()
+    config = root / "kakera.json"
+    config.write_text(json.dumps({
+        "todoist": {"project_id": "p"},
+        "telegram": {
+            "chat_id": "-1001",
+            "allowed_user_ids": [42, 99],
+            "report_user_id": 42,
+        },
+    }))
+    task = {"id": "task", "content": "https://x.com/a/status/fail", "labels": []}
+    replies = []
+
+    def record_reply(*args):
+        replies.append(args)
+
+    with (
+        patch.object(kakera, "CONFIG", config),
+        patch.dict(kakera.os.environ, {
+            "TODOIST_API_TOKEN": "token",
+            "TELEGRAM_BOT_TOKEN": "secret",
+        }),
+        patch.object(kakera, "todoist_task_pages", return_value=iter([[task]])),
+        patch.object(kakera, "todoist_request", return_value={}),
+        patch.object(kakera, "save", return_value=(False, "no images")),
+        patch.object(kakera, "telegram_send_text", side_effect=record_reply),
+    ):
+        assert kakera.process_todoist(None, notes, attachments) == 1
+    assert [(chat, text) for chat, text, _token in replies] == [
+        ("42", "Todoist: https://x.com/a/status/fail: no images"),
+    ]
+
+    replies.clear()
+    config.write_text(json.dumps({
+        "todoist": {"project_id": "p"},
+        "telegram": {"chat_id": "-1001", "allowed_user_ids": [42, 99]},
+    }))
+    with (
+        patch.object(kakera, "CONFIG", config),
+        patch.dict(kakera.os.environ, {
+            "TODOIST_API_TOKEN": "token",
+            "TELEGRAM_BOT_TOKEN": "secret",
+        }),
+        patch.object(kakera, "todoist_task_pages", return_value=iter([[task]])),
+        patch.object(kakera, "todoist_request", return_value={}),
+        patch.object(kakera, "save", return_value=(False, "no images")),
+        patch.object(kakera, "telegram_send_text", side_effect=record_reply),
+    ):
+        assert kakera.process_todoist(None, notes, attachments) == 1
+    assert replies == []
+    config.write_text(json.dumps({
+        "todoist": {"project_id": "p"},
+        "telegram": {
+            "chat_id": "-1001",
+            "allowed_user_ids": [42, 99],
+            "report_user_id": 99,
+        },
+    }))
+
+    replies.clear()
+    with (
+        patch.object(kakera, "CONFIG", config),
+        patch.dict(kakera.os.environ, {
+            "TODOIST_API_TOKEN": "token",
+            "TELEGRAM_BOT_TOKEN": "",
+        }),
+        patch.object(kakera, "todoist_task_pages", return_value=iter([[task]])),
+        patch.object(kakera, "todoist_request", return_value={}),
+        patch.object(kakera, "save", return_value=(False, "no images")),
+        patch.object(kakera, "telegram_send_text", side_effect=record_reply),
+    ):
+        assert kakera.process_todoist(None, notes, attachments) == 1
+    assert replies == []
+
+    skipped = {"id": "skip", "content": "no url here", "labels": []}
+    replies.clear()
+    with (
+        patch.object(kakera, "CONFIG", config),
+        patch.dict(kakera.os.environ, {
+            "TODOIST_API_TOKEN": "token",
+            "TELEGRAM_BOT_TOKEN": "secret",
+        }),
+        patch.object(kakera, "todoist_task_pages", return_value=iter([[skipped]])),
+        patch.object(kakera, "telegram_send_text", side_effect=record_reply),
+        redirect_stdout(io.StringIO()),
+    ):
+        assert kakera.process_todoist(None, notes, attachments) == 0
+    assert replies == []
+
+    reported = {}
+    replies.clear()
+    with (
+        patch.object(kakera, "CONFIG", config),
+        patch.dict(kakera.os.environ, {
+            "TODOIST_API_TOKEN": "token",
+            "TELEGRAM_BOT_TOKEN": "secret",
+        }),
+        patch.object(kakera, "todoist_task_pages", side_effect=lambda *_a, **_k: iter([[task]])),
+        patch.object(kakera, "todoist_request", return_value={}),
+        patch.object(kakera, "save", return_value=(False, "no images")),
+        patch.object(kakera, "telegram_send_text", side_effect=record_reply),
+    ):
+        assert kakera.process_todoist(None, notes, attachments, reported=reported) == 1
+        assert kakera.process_todoist(None, notes, attachments, reported=reported) == 1
+    assert [(chat, text) for chat, text, _token in replies] == [
+        ("99", "Todoist: https://x.com/a/status/fail: no images"),
+    ]
+
+    replies.clear()
+    with (
+        patch.object(kakera, "CONFIG", config),
+        patch.dict(kakera.os.environ, {
+            "TODOIST_API_TOKEN": "token",
+            "TELEGRAM_BOT_TOKEN": "secret",
+        }),
+        patch.object(kakera, "todoist_task_pages", side_effect=lambda *_a, **_k: iter([[task]])),
+        patch.object(kakera, "todoist_request", return_value={}),
+        patch.object(kakera, "save", side_effect=[
+            (True, "saved"), (False, "expired"),
+        ]),
+        patch.object(kakera, "telegram_send_text", side_effect=record_reply),
+    ):
+        assert kakera.process_todoist(None, notes, attachments, reported=reported) == 0
+        assert kakera.process_todoist(None, notes, attachments, reported=reported) == 1
+    assert [(chat, text) for chat, text, _token in replies] == [
+        ("99", "Todoist: https://x.com/a/status/fail: expired"),
+    ]
+
+    only_task = {
+        "id": "only",
+        "content": "https://x.com/a/status/only",
+        "labels": ["share/telegram-only"],
+    }
+    replies.clear()
+    with (
+        patch.object(kakera, "CONFIG", config),
+        patch.dict(kakera.os.environ, {
+            "TODOIST_API_TOKEN": "token",
+            "TELEGRAM_BOT_TOKEN": "secret",
+        }),
+        patch.object(kakera, "todoist_task_pages", return_value=iter([[only_task]])),
+        patch.object(kakera, "todoist_request", return_value={}),
+        patch.object(kakera, "save") as save,
+        patch.object(
+            kakera, "telegram_only_url",
+            return_value=(False, "Telegram not sent: failed"),
+        ),
+        patch.object(kakera, "telegram_send_text", side_effect=record_reply),
+    ):
+        assert kakera.process_todoist(None, notes, attachments) == 1
+    assert not save.called
+    assert "Todoist: https://x.com/a/status/only: Telegram not sent: failed" in replies[0][1]
+
+    inbox = root / "inbox.md"
+    inbox.write_text("- [ ] https://www.instagram.com/p/FAIL/\n")
+    replies.clear()
+    with (
+        patch.object(kakera, "CONFIG", config),
+        patch.dict(kakera.os.environ, {"TELEGRAM_BOT_TOKEN": "secret"}),
+        patch.object(kakera, "save", return_value=(False, "failed")),
+        patch.object(kakera, "telegram_send_text", side_effect=record_reply),
+    ):
+        assert kakera.process_inbox(inbox, None, notes, attachments) == 1
+    assert "[ ]" in inbox.read_text()
+    assert replies[0][1] == "Inbox: https://www.instagram.com/p/FAIL/: failed"
+
+    session_task = {"id": "ig1", "content": "https://www.instagram.com/p/WALL/", "labels": []}
+    session_task2 = {"id": "ig2", "content": "https://www.instagram.com/p/WALL2/", "labels": []}
+    replies.clear()
+    with (
+        patch.object(kakera, "CONFIG", config),
+        patch.dict(kakera.os.environ, {
+            "TODOIST_API_TOKEN": "token",
+            "TELEGRAM_BOT_TOKEN": "secret",
+        }),
+        patch.object(kakera, "todoist_task_pages", return_value=iter([[session_task, session_task2]])),
+        patch.object(kakera, "todoist_request", return_value={}),
+        patch.object(kakera, "save", return_value=(False, kakera.INSTAGRAM_SESSION_EXPIRED)),
+        patch.object(kakera, "telegram_send_text", side_effect=record_reply),
+    ):
+        assert kakera.process_todoist(None, notes, attachments) == 1
+    assert len(replies) == 1
+    assert replies[0][0] == "99"
+    assert replies[0][1] == (
+        "Todoist: Instagram session expired\n"
+        "https://www.instagram.com/p/WALL/\n"
+        "https://www.instagram.com/p/WALL2/"
+    )
+
+    mixed_task = {
+        "id": "mix",
+        "content": "https://x.com/a/status/ok\nhttps://www.instagram.com/p/PRIV/",
+        "labels": [],
+    }
+    replies.clear()
+    with (
+        patch.object(kakera, "CONFIG", config),
+        patch.dict(kakera.os.environ, {
+            "TODOIST_API_TOKEN": "token",
+            "TELEGRAM_BOT_TOKEN": "secret",
+        }),
+        patch.object(kakera, "todoist_task_pages", return_value=iter([[mixed_task]])),
+        patch.object(kakera, "todoist_request", return_value={}) as close,
+        patch.object(kakera, "save_composed", side_effect=lambda *args, **kwargs: (
+            kwargs.get("named_failures", {}).setdefault(
+                kakera.INSTAGRAM_FOLLOWERS_ONLY, []
+            ).append("https://www.instagram.com/p/PRIV/") or (True, "saved 1 image(s); 1 source(s) failed")
+        )),
+        patch.object(kakera, "telegram_send_text", side_effect=record_reply),
+    ):
+        assert kakera.process_todoist(None, notes, attachments) == 0
+    assert "/tasks/mix/close" in close.call_args.args[1]
+    assert replies[0][1] == (
+        "Todoist: Instagram post is followers-only\n"
+        "https://www.instagram.com/p/PRIV/"
+    )
+
+    watch_replies = []
+    ticks = [0]
+
+    def fail_then_stop(_interval):
+        ticks[0] += 1
+        if ticks[0] >= 2:
+            raise KeyboardInterrupt
+
+    with (
+        patch.object(kakera, "CONFIG", config),
+        patch.dict(kakera.os.environ, {
+            "TODOIST_API_TOKEN": "token",
+            "TELEGRAM_BOT_TOKEN": "secret",
+        }),
+        patch.object(kakera, "process_todoist", side_effect=ValueError("Todoist request failed")),
+        patch.object(kakera.time, "sleep", side_effect=fail_then_stop),
+        patch.object(kakera, "telegram_send_text", side_effect=lambda *args: watch_replies.append(args)),
+        redirect_stdout(io.StringIO()),
+        redirect_stderr(io.StringIO()),
+    ):
+        assert kakera.watch_todoist(None, notes, attachments) == 0
+    assert [(chat, text) for chat, text, _token in watch_replies] == [
+        ("99", "Todoist: Todoist request failed"),
+    ]

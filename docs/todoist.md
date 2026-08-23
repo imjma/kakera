@@ -95,7 +95,9 @@ depth-first, with each task's content before its description. The first URL is
 the Primary Source; later URLs are written into Additional Source Markdown sections.
 If at least one image is saved, the root task is completed even when another
 source failed; the failure reason remains in the Source Note. If no source
-produces an image, the task stays open for retry.
+produces an image, the task stays open for retry. When
+`telegram.report_user_id` is set, that failure is reported in that allowed
+user's private chat; `kakera telegram --watch` does not need to be running.
 
 Native Todoist labels on the parent and nested subtasks become Capture Tags in
 the same depth-first order as their URLs. Use `--tag` to add tags to every

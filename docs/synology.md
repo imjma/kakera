@@ -132,7 +132,10 @@ scp /path/to/kakera/kakera.json \
   YOUR_USERNAME@YOUR_NAS_IP:/volume1/docker/kakera/deploy/synology/config/kakera.json
 ```
 
-After copying, restore the runtime ownership and private mode on the NAS:
+After copying, set `obsidian.vault` to `/vault`, `browser` to `null`, and
+`telegram.report_user_id` to the allowed user who should receive Todoist
+capture-failure reports (including `Instagram session expired` when NAS cookies
+die). Then restore the runtime ownership and private mode on the NAS:
 
 ```sh
 cd /volume1/docker/kakera/deploy/synology
@@ -164,12 +167,13 @@ Otherwise edit the generated example with `vi config/kakera.json`. The NAS confi
   },
   "telegram": {
     "chat_id": "-1001234567890",
-    "allowed_user_ids": [123456789]
+    "allowed_user_ids": [123456789],
+    "report_user_id": 123456789
   }
 }
 ```
 
-Keep `browser` as `null`; a NAS container has no browser session. Keep `obsidian.vault` as `/vault`, not the host path. `telegram.chat_id` is the delivery destination, while `allowed_user_ids` contains the individual Telegram users permitted to submit private messages. Follow the main README's Telegram setup if these IDs are not already known.
+Keep `browser` as `null`; a NAS container has no browser session. Keep `obsidian.vault` as `/vault`, not the host path. `telegram.chat_id` is the delivery destination, `allowed_user_ids` contains the individual Telegram users permitted to submit private messages, and `report_user_id` is the one allowed user who receives Inbox and Todoist capture-failure reports. Follow the main README's Telegram setup if these IDs are not already known.
 
 The account aliases must match the cookie filenames exactly. For example:
 
@@ -288,7 +292,7 @@ sudo docker compose --profile workers logs --tail 100 todoist telegram
 
 The shared `state/` directory persists the Telegram update offset, Reddit OAuth cache, and Kakera's cross-process capture locks. Both services restart automatically unless explicitly stopped. Empty Todoist and Telegram logs are normal while both watchers are idle.
 
-Test Telegram Intake by sending the bot a private message from an allowed user containing a supported Source Service URL. Success appears in the configured destination chat and does not reply to the private message. Test Todoist by adding a task containing a supported URL to the configured project; within the configured interval it should create a note and attachment, sync them to another Obsidian device, and close the task.
+Test Telegram Intake by sending the bot a private message from an allowed user containing a supported Source Service URL. Success appears in the configured destination chat and does not reply to the private message. A failed Intake (including `Instagram session expired` or `Instagram post is followers-only`) replies in that private chat. Test Todoist by adding a task containing a supported URL to the configured project; within the configured interval it should create a note and attachment, sync them to another Obsidian device, and close the task. A failed Todoist capture is reported to `telegram.report_user_id` when that key is set; named Instagram failures report even if another source in the group saved. Restarting workers is enough after editing `config/kakera.json`. A new `kakera.py` requires a rebuild.
 
 ## Operations
 
@@ -299,4 +303,12 @@ sudo docker compose --profile workers restart todoist telegram
 sudo docker compose --profile workers down
 ```
 
-For updates, stop the workers, take a vault snapshot, change the pinned image or package version deliberately, rebuild, run a one-time sync and status check, then start the workers again. Restore individual damaged files from Snapshot Replication; restore the NAS or volume from the independent backup.
+To pick up a new `kakera.py` (named Instagram errors, Todoist Telegram reports), rebuild both workers so they share `kakera:local`:
+
+```sh
+sudo docker compose --profile workers stop
+sudo docker compose --profile workers build
+sudo docker compose --profile workers up -d
+```
+
+`restart` keeps the old image. For other updates, stop the workers, take a vault snapshot, change the pinned image or package version deliberately, rebuild, run a one-time sync and status check, then start the workers again. Restore individual damaged files from Snapshot Replication; restore the NAS or volume from the independent backup.
