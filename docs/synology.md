@@ -306,12 +306,11 @@ sudo docker compose --profile workers down
 To pick up a new `kakera.py` (named Instagram errors, Todoist Telegram reports), rebuild both workers so they share `kakera:local`:
 
 ```sh
-sudo docker compose --profile workers stop
-sudo docker compose --profile workers build
-sudo docker compose --profile workers up -d
+cd /volume1/docker/kakera
+make restart
 ```
 
-`restart` keeps the old image. For other updates, stop the workers, take a vault snapshot, change the pinned image or package version deliberately, rebuild, run a one-time sync and status check, then start the workers again. Restore individual damaged files from Snapshot Replication; restore the NAS or volume from the independent backup.
+`docker compose restart` keeps the old image. For other updates, stop the workers, take a vault snapshot, change the pinned image or package version deliberately, rebuild, run a one-time sync and status check, then start the workers again. Restore individual damaged files from Snapshot Replication; restore the NAS or volume from the independent backup.
 
 Each Kakera worker keeps three 10 MB json-file log segments. Recreate the workers after changing that Compose logging (it is fixed at create time):
 
