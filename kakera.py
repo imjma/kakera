@@ -58,6 +58,9 @@ INSTAGRAM_FOLLOWERS_ONLY = "Instagram post is followers-only"
 TELEGRAM_STATE = Path(os.environ.get(
     "KAKERA_TELEGRAM_STATE", ROOT / "kakera.telegram-state.json"
 ))
+REPORT_STATE = Path(os.environ.get(
+    "KAKERA_REPORT_STATE", TELEGRAM_STATE.with_name("kakera.report-state.json")
+))
 TELEGRAM_LONG_POLL = 60
 TELEGRAM_MAX_IMAGES = 10
 TELEGRAM_MAX_BYTES = 10 * 1024 * 1024
@@ -725,6 +728,76 @@ def instagram_fetch_error(stderr: str) -> str | None:
     return None
 
 
+def queue_failure_seen(reported: dict | None, urls: list[str], message: str) -> bool:
+    if reported is None:
+        return False
+    reason = instagram_named_error(message)
+    if reason:
+        already = reported.get(("instagram", reason))
+        return isinstance(already, set) and all(
+            published_url(url) in already for url in urls
+        )
+    detail = f"{', '.join(published_url(url) for url in urls)}: {message}"
+    return reported.get(("capture", tuple(urls))) == detail
+
+
+def log_queue_result(reported: dict | None, urls: list[str], success: bool, message: str) -> None:
+    if success or not queue_failure_seen(reported, urls, message):
+        print(f"{process_stamp()} {'ok' if success else 'error'}: {', '.join(urls)}: {message}")
+
+
+def load_report_state() -> dict:
+    try:
+        data = json.loads(REPORT_STATE.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    reported: dict = {}
+    instagram = data.get("instagram")
+    if isinstance(instagram, dict):
+        for reason in (INSTAGRAM_SESSION_EXPIRED, INSTAGRAM_FOLLOWERS_ONLY):
+            urls = instagram.get(reason)
+            if isinstance(urls, list):
+                reported[("instagram", reason)] = {
+                    url for url in urls if isinstance(url, str)
+                }
+    for item in data.get("capture") or []:
+        if not isinstance(item, dict):
+            continue
+        urls, detail = item.get("urls"), item.get("detail")
+        if isinstance(urls, list) and all(isinstance(url, str) for url in urls) and isinstance(detail, str):
+            reported[("capture", tuple(urls))] = detail
+    watch = data.get("watch")
+    if isinstance(watch, str):
+        reported["watch"] = watch
+    return reported
+
+
+def save_report_state(reported: dict) -> None:
+    instagram = {}
+    capture = []
+    watch = reported.get("watch")
+    for key, value in reported.items():
+        if isinstance(key, tuple) and len(key) == 2 and key[0] == "instagram" and isinstance(value, set):
+            instagram[key[1]] = sorted(value)
+        elif isinstance(key, tuple) and len(key) == 2 and key[0] == "capture" and isinstance(value, str):
+            capture.append({"urls": list(key[1]), "detail": value})
+    payload = {"instagram": instagram, "capture": capture}
+    if isinstance(watch, str):
+        payload["watch"] = watch
+    try:
+        REPORT_STATE.parent.mkdir(parents=True, exist_ok=True)
+        encoded = json.dumps(payload, separators=(",", ":")) + "\n"
+        temporary = REPORT_STATE.with_suffix(REPORT_STATE.suffix + ".tmp")
+        temporary.write_text(encoded)
+        os.replace(temporary, REPORT_STATE)
+    except OSError:
+        return
+
+
 def format_named_instagram(named: dict[str, list[str]]) -> str:
     parts = []
     for reason in (INSTAGRAM_SESSION_EXPIRED, INSTAGRAM_FOLLOWERS_ONLY):
@@ -741,16 +814,21 @@ def report_named_instagram_failures(
 ) -> None:
     for reason in (INSTAGRAM_SESSION_EXPIRED, INSTAGRAM_FOLLOWERS_ONLY):
         urls = list(dict.fromkeys(published_url(url) for url in named.get(reason, [])))
-        if not urls:
-            if reported is not None:
-                reported.pop(("instagram", reason), None)
+        key = ("instagram", reason)
+        already = reported.get(key) if reported is not None else None
+        if not isinstance(already, set):
+            already = set()
+        current = set(urls)
+        if reported is not None:
+            already &= current
+            reported[key] = already
+        new = [url for url in urls if url not in already]
+        if not new:
             continue
-        report_queue_failure(
-            origin,
-            reason + "\n" + "\n".join(urls),
-            key=("instagram", reason),
-            reported=reported,
-        )
+        if report_queue_failure(origin, reason + "\n" + "\n".join(new)):
+            already.update(new)
+            if reported is not None:
+                reported[key] = already
 
 
 def report_queue_failure(
@@ -759,25 +837,26 @@ def report_queue_failure(
     *,
     key: object = None,
     reported: dict | None = None,
-) -> None:
+) -> bool:
     if reported is not None and key is not None and reported.get(key) == detail:
-        return
+        return False
     try:
         token = telegram_token()
         user_id = configured_telegram_report_user_id()
     except ValueError as error:
         if str(error) != "TELEGRAM_BOT_TOKEN is not set":
             stamp_print(f"error: {error}", error=True)
-        return
+        return False
     if user_id is None:
-        return
+        return False
     try:
         telegram_send_text(str(user_id), f"{origin}: {detail}", token)
     except ValueError as error:
         stamp_print(f"error: cannot report in Telegram: {error}", error=True)
-        return
+        return False
     if reported is not None and key is not None:
         reported[key] = detail
+    return True
 
 
 @contextmanager
@@ -1139,7 +1218,7 @@ def process_todoist(
             urls, browser, notes, attachments, account, twitter_account,
             capture_tags or None, named_failures=named,
         )
-        print(f"{process_stamp()} {'ok' if success else 'error'}: {', '.join(urls)}: {message}")
+        log_queue_result(reported, urls, success, message)
         capture_key = ("capture", tuple(urls))
         if not success:
             failed = True
@@ -1181,7 +1260,7 @@ def watch_todoist(
     tags: list[str] | None = None,
 ) -> int:
     stamp_print("ok: watching Todoist")
-    reported: dict = {}
+    reported = load_report_state()
     try:
         while True:
             try:
@@ -1190,10 +1269,12 @@ def watch_todoist(
                     reported=reported,
                 )
             except (OSError, ValueError) as error:
-                stamp_print(f"error: {error}", error=True)
+                if str(error) != reported.get("watch"):
+                    stamp_print(f"error: {error}", error=True)
                 report_queue_failure("Todoist", str(error), key="watch", reported=reported)
             else:
                 reported.pop("watch", None)
+            save_report_state(reported)
             time.sleep(interval)
     except KeyboardInterrupt:
         stamp_print("ok: stopped watching Todoist")
@@ -2467,7 +2548,7 @@ def process_transient_urls(
     failed = False
     for url in urls:
         success, message = telegram_only_url(url, browser, account, twitter_account)
-        print(f"{process_stamp()} {'ok' if success else 'error'}: {url}: {message}")
+        log_queue_result(reported, [url], success, message)
         capture_key = ("capture", (url,))
         if success:
             if reported is not None:
@@ -2992,7 +3073,7 @@ def process_inbox(
             urls, browser, notes, attachments, account, twitter_account,
             capture_tags or None, named_failures=named,
         )
-        print(f"{process_stamp()} {'ok' if success else 'error'}: {', '.join(urls)}: {message}")
+        log_queue_result(reported, urls, success, message)
         if success:
             if reported is not None:
                 reported.pop(capture_key, None)
@@ -3178,7 +3259,7 @@ def watch_inbox(
     tags: list[str] | None = None,
 ) -> int:
     completed: set[str] = set()
-    reported: dict = {}
+    reported = load_report_state()
     if not inbox.exists():
         process_inbox(
             inbox, browser, notes, attachments, account, completed, False, twitter_account, tags,
@@ -3207,6 +3288,7 @@ def watch_inbox(
                     stamp_print(f"error: {error}", error=True)
                     reported_error = str(error)
                 report_queue_failure("Inbox", str(error), key="watch", reported=reported)
+            save_report_state(reported)
             time.sleep(interval)
     except KeyboardInterrupt:
         stamp_print("ok: stopped watching inbox")

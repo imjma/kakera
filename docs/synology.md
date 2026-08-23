@@ -290,7 +290,7 @@ sudo docker compose --profile workers ps
 sudo docker compose --profile workers logs --tail 100 todoist telegram
 ```
 
-The shared `state/` directory persists the Telegram update offset, Reddit OAuth cache, and Kakera's cross-process capture locks. Both services restart automatically unless explicitly stopped. Empty Todoist and Telegram logs are normal while both watchers are idle.
+The shared `state/` directory persists the Telegram update offset, already-reported queue failures (`kakera.report-state.json`), Reddit OAuth cache, and Kakera's cross-process capture locks. Both services restart automatically unless explicitly stopped. Empty Todoist and Telegram logs are normal while both watchers are idle. A failure already stored there is not printed again and is not sent to Telegram again until it succeeds and later fails.
 
 Test Telegram Intake by sending the bot a private message from an allowed user containing a supported Source Service URL. Success appears in the configured destination chat and does not reply to the private message. A failed Intake (including `Instagram session expired` or `Instagram post is followers-only`) replies in that private chat. Test Todoist by adding a task containing a supported URL to the configured project; within the configured interval it should create a note and attachment, sync them to another Obsidian device, and close the task. A failed Todoist capture is reported to `telegram.report_user_id` when that key is set; named Instagram failures report even if another source in the group saved. Restarting workers is enough after editing `config/kakera.json`. A new `kakera.py` requires a rebuild.
 
@@ -312,3 +312,11 @@ sudo docker compose --profile workers up -d
 ```
 
 `restart` keeps the old image. For other updates, stop the workers, take a vault snapshot, change the pinned image or package version deliberately, rebuild, run a one-time sync and status check, then start the workers again. Restore individual damaged files from Snapshot Replication; restore the NAS or volume from the independent backup.
+
+Each Kakera worker keeps three 10 MB json-file log segments. Recreate the workers after changing that Compose logging (it is fixed at create time):
+
+```sh
+sudo docker compose --profile workers up -d --force-recreate
+```
+
+The same cap is on the Obsidian service; recreate it only if you also want Sync logs rotated.

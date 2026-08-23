@@ -5,6 +5,7 @@ __pycache__/
 .python-version
 kakera.json
 kakera.telegram-state.json
+kakera.report-state.json
 .cookies/
 downloads/
 attachments/

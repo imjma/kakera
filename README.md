@@ -371,8 +371,11 @@ refused. Identical failures are not re-reported until the reason changes or a
 later capture succeeds. Missing `report_user_id` or Telegram configuration
 skips the report without changing capture behavior. Named Instagram Failed
 Sources (`Instagram session expired` and `Instagram post is followers-only`)
-are one report per class per poll, even when another source in the group
-saved; Intake replies to the sender with the same reason.
+are one report per class listing only URLs not already sent in this watch,
+even when another source in the group saved. That set is stored in
+`kakera.report-state.json` (next to the Telegram Intake state), so a Docker
+restart does not print or Telegram the same failures again. Intake replies to
+the sender with the same reason.
 
 The last consumed Telegram `update_id` is stored in `kakera.telegram-state.json`
 next to `kakera.json` (gitignored). A second `kakera telegram --watch` fails

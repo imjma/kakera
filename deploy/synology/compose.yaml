@@ -8,6 +8,12 @@ x-kakera-environment: &kakera-environment
   TMPDIR: /state/tmp
   TZ: ${TZ:-Australia/Sydney}
 
+x-logging: &kakera-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 x-kakera: &kakera
   image: kakera:local
   build:
@@ -17,6 +23,7 @@ x-kakera: &kakera
   init: true
   read_only: true
   restart: unless-stopped
+  logging: *kakera-logging
   profiles: [workers]
   depends_on:
     obsidian:
@@ -37,6 +44,7 @@ services:
     init: true
     read_only: true
     restart: unless-stopped
+    logging: *kakera-logging
     environment:
       HOME: /config
       TZ: ${TZ:-Australia/Sydney}
