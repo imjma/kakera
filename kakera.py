@@ -723,6 +723,9 @@ def instagram_fetch_error(stderr: str) -> str | None:
     folded = stderr.casefold()
     if "posts are private" in folded or "post is private" in folded:
         return INSTAGRAM_FOLLOWERS_ONLY
+    if ("[instagram]" in folded and "httperror" in folded
+            and "400 bad request" in folded and "/media/" in folded and "/info/" in folded):
+        return INSTAGRAM_FOLLOWERS_ONLY
     if "[instagram]" in folded and "login page" in folded:
         return INSTAGRAM_SESSION_EXPIRED
     return None

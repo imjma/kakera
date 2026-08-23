@@ -522,6 +522,15 @@ with TemporaryDirectory() as directory:
         assert kakera.save(url, None, root / "downloads", root / "attachments") == (
             False, kakera.INSTAGRAM_FOLLOWERS_ONLY
         )
+    info_error = CompletedProcess(
+        [], 1, "",
+        "[instagram][error] HttpError: '400 Bad Request' for "
+        "'https://www.instagram.com/api/v1/media/3969151256435385262/info/'",
+    )
+    with patch.object(kakera.subprocess, "run", return_value=info_error):
+        assert kakera.save(url, None, root / "downloads", root / "attachments") == (
+            False, kakera.INSTAGRAM_FOLLOWERS_ONLY
+        )
 
     def fake_mixed(command, **_):
         submitted = command[-1]
