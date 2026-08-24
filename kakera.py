@@ -270,6 +270,14 @@ def capture_id(url: str) -> str:
                 if marker in segments and segments.index(marker) + 1 < len(segments):
                     post_id = segments[segments.index(marker) + 1]
                     break
+            if (
+                not post_id
+                and len(segments) >= 4
+                and segments[0] in {"r", "u", "user"}
+                and segments[2] == "s"
+                and re.fullmatch(r"[A-Za-z0-9]{10}", segments[3])
+            ):
+                post_id = segments[3]
         if not post_id:
             raise ValueError("Reddit URL must be an individual post")
     elif host in rednote_hosts:
@@ -2697,6 +2705,15 @@ def fetch_source(
                 pass
     service = name.split("-", 1)[0]
     published = published_url(normalized_url)
+    if service == "reddit" and isinstance(metadata, dict):
+        reddit_id = metadata.get("id")
+        if isinstance(reddit_id, str) and re.fullmatch(r"[a-z0-9]{1,12}", reddit_id):
+            name = f"reddit-{reddit_id}"
+        permalink = metadata.get("permalink")
+        if isinstance(permalink, str) and permalink.startswith("/"):
+            published = published_url(
+                "https://www.reddit.com" + permalink.split("?", 1)[0].rstrip("/")
+            )
     metadata = _normalise_source_metadata(name, service, metadata, published)
     return {"name": name, "service": service, "url": published,
             "metadata": metadata, "valid": valid}, None

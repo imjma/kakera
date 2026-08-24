@@ -98,6 +98,8 @@ with TemporaryDirectory() as directory:
         "https://www.instagram.com/p/DbqJEsLna8A/?foo=bar#comments",
     ) == normalized_note
 assert capture_id("https://redd.it/1abcxyz?utm_source=share") == "reddit-1abcxyz"
+assert capture_id("https://www.reddit.com/r/AnalogNudes/s/0zmwMgxI3q") == "reddit-0zmwMgxI3q"
+assert capture_id("https://www.reddit.com/user/artist/s/abcdefghij") == "reddit-abcdefghij"
 assert canonical_url("https://redd.it/1abcxyz/?utm_source=x&keep=yes#top") == "https://redd.it/1abcxyz?keep=yes"
 assert capture_id("http://xhslink.com/o/ABC").startswith("rednote-")
 assert capture_id("http://xhslink.com/m/1JXFZx4ards") == "rednote-1JXFZx4ards"
@@ -843,6 +845,27 @@ with TemporaryDirectory() as directory:
         assert "extractor.reddit.client-id=client-id" in command
         assert "extractor.reddit.user-agent=Python:kakera:v0.1 (by /u/test)" in command
 
+        def fake_share_download(command, **_):
+            target = Path(command[command.index("--directory") + 1]) / "remote-name.jpg"
+            target.write_bytes(b"\xff\xd8\xff\xe0image")
+            target.with_suffix(".jpg.json").write_text(json.dumps({
+                "id": "1abcxyz",
+                "permalink": "/r/AnalogNudes/comments/1abcxyz/title/",
+                "title": "Share target",
+            }))
+            return CompletedProcess(command, 0, "", "")
+
+        with patch.object(kakera.subprocess, "run", side_effect=fake_share_download) as share_run:
+            saved, message = kakera.save(
+                "https://www.reddit.com/r/AnalogNudes/s/0zmwMgxI3q",
+                None, vault / "Clippings", vault / "assets",
+            )
+        assert saved, message
+        assert "r/AnalogNudes/s/0zmwMgxI3q" in share_run.call_args.args[0][-1]
+        assert (vault / "assets" / "reddit" / "reddit-1abcxyz-01.jpg").is_file()
+        share_note = next((vault / "Clippings").glob("*.md"))
+        assert '"https://www.reddit.com/r/AnalogNudes/comments/1abcxyz/title"' in share_note.read_text()
+
     inbox = vault / "Kakera" / "inbox.md"
     inbox.parent.mkdir()
     inbox.write_text(
@@ -1127,7 +1150,13 @@ with TemporaryDirectory() as directory:
     assert "additional text" in metadata_text
     assert "  - reddit" not in metadata_text.split("tags:", 1)[1]
 
-    for profile in ("https://www.instagram.com/artist/", "https://www.reddit.com/user/artist/"):
+    for profile in (
+        "https://www.instagram.com/artist/",
+        "https://www.reddit.com/user/artist/",
+        "https://www.reddit.com/r/AnalogNudes/",
+        "https://www.reddit.com/r/AnalogNudes/s/short",
+        "https://www.reddit.com/r/AnalogNudes/s/0zmwMgxI3qEXTRA",
+    ):
         try:
             kakera.capture_id(profile)
         except ValueError:
