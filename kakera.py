@@ -199,6 +199,45 @@ def normalize_instagram_post_url(url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, f"/{shape}/{segments[1]}/", "", ""))
 
 
+def reddit_share_url(url: str) -> bool:
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if host not in {"reddit.com", "www.reddit.com", "old.reddit.com", "np.reddit.com"}:
+        return False
+    segments = [segment for segment in parts.path.split("/") if segment]
+    return (
+        len(segments) >= 4
+        and segments[0] in {"r", "u", "user"}
+        and segments[2] == "s"
+        and bool(re.fullmatch(r"[A-Za-z0-9]{10}", segments[3]))
+    )
+
+
+def resolve_reddit_share_url(url: str) -> str:
+    if not reddit_share_url(url):
+        return url
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; Kakera/0.1)"}
+    try:
+        with urlopen(Request(url, headers=headers), timeout=30) as response:
+            final = response.url
+    except (OSError, ValueError):
+        return url
+    parts = urlsplit(final)
+    host = (parts.hostname or "").lower()
+    segments = [segment for segment in parts.path.split("/") if segment]
+    if host == "redd.it" and segments:
+        return urlunsplit(("https", "redd.it", "/" + segments[0], "", ""))
+    if host not in {"reddit.com", "www.reddit.com", "old.reddit.com", "np.reddit.com"}:
+        return url
+    for marker in ("comments", "gallery"):
+        if marker in segments:
+            index = segments.index(marker)
+            if index + 1 < len(segments):
+                path = "/" + "/".join(segments[: index + 2])
+                return urlunsplit(("https", "www.reddit.com", path, "", ""))
+    return url
+
+
 def published_url(url: str) -> str:
     """URL stored on a Source Note and sent in a Telegram caption."""
     url = normalize_instagram_post_url(url)
@@ -734,6 +773,24 @@ def instagram_fetch_error(stderr: str) -> str | None:
     if "[instagram]" in folded and "login page" in folded:
         return INSTAGRAM_SESSION_EXPIRED
     return None
+
+
+def reddit_fetch_error(stderr: str) -> str | None:
+    line = next((item for item in reversed(stderr.splitlines()) if item.strip()), "")
+    if ":root{" in line or "--rem" in line or ".theme-light" in line or (
+            "[reddit]" in stderr and len(line) > 400):
+        return "Reddit blocked the request"
+    return None
+
+
+def compact_fetch_error(stderr: str) -> str:
+    named = instagram_fetch_error(stderr)
+    if named:
+        return named
+    reddit = reddit_fetch_error(stderr)
+    if reddit:
+        return reddit
+    return next((line for line in reversed(stderr.splitlines()) if line.strip()), "download failed")
 
 
 def queue_failure_seen(reported: dict | None, urls: list[str], message: str) -> bool:
@@ -2596,6 +2653,12 @@ def fetch_source(
     except ValueError as error:
         return None, str(error)
     normalized_url = normalize_instagram_post_url(url)
+    if name.startswith("reddit-"):
+        normalized_url = resolve_reddit_share_url(normalized_url)
+        try:
+            name = capture_id(normalized_url)
+        except ValueError:
+            pass
     metadata: dict = {}
     result = None
     if name.startswith("rednote-"):
@@ -2623,6 +2686,7 @@ def fetch_source(
         elif browser:
             command.extend(("--cookies-from-browser", browser))
         if name.startswith("reddit-"):
+            command.extend(("-o", "extractor.reddit.api=oauth"))
             try:
                 reddit = configured_reddit()
             except ValueError as error:
@@ -2637,10 +2701,8 @@ def fetch_source(
         command.append(normalized_url)
         result = subprocess.run(command, capture_output=True, text=True)
     if result and result.returncode:
-        error = instagram_fetch_error(result.stderr or "")
-        if not error:
-            error = next((line for line in reversed(result.stderr.splitlines()) if line.strip()), "download failed")
-        if error not in {INSTAGRAM_SESSION_EXPIRED, INSTAGRAM_FOLLOWERS_ONLY} and "[reddit]" in error:
+        error = compact_fetch_error(result.stderr or "")
+        if error not in {INSTAGRAM_SESSION_EXPIRED, INSTAGRAM_FOLLOWERS_ONLY} and "[reddit]" in (result.stderr or ""):
             try:
                 configured = configured_reddit()
             except ValueError:

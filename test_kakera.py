@@ -842,8 +842,35 @@ with TemporaryDirectory() as directory:
                 "https://redd.it/1abcxyz", None, vault / "Clippings", vault / "assets"
             )[0]
         command = run.call_args.args[0]
+        assert "extractor.reddit.api=oauth" in command
         assert "extractor.reddit.client-id=client-id" in command
         assert "extractor.reddit.user-agent=Python:kakera:v0.1 (by /u/test)" in command
+
+        css_error = CompletedProcess(
+            [], 1, "",
+            "[reddit][error] .theme-light,:root{--rem360:22.5rem;" + ("x" * 500),
+        )
+        with patch.object(kakera.subprocess, "run", return_value=css_error):
+            assert kakera.save(
+                "https://redd.it/1abcxyz", None, vault / "Clippings", vault / "assets"
+            ) == (False, "Reddit blocked the request")
+
+        class ShareRedirect:
+            url = "https://www.reddit.com/r/analog/comments/1vw6kvs/title/?share_id=abc&utm_source=share"
+            def __enter__(self):
+                return self
+            def __exit__(self, *_arguments):
+                return False
+            def read(self, _limit=-1):
+                return b""
+        with patch.object(kakera, "urlopen", return_value=ShareRedirect()):
+            assert kakera.resolve_reddit_share_url(
+                "https://www.reddit.com/r/analog/s/SxUF0FKk9M"
+            ) == "https://www.reddit.com/r/analog/comments/1vw6kvs"
+        with patch.object(kakera, "urlopen", side_effect=OSError("blocked")):
+            assert kakera.resolve_reddit_share_url(
+                "https://www.reddit.com/r/analog/s/SxUF0FKk9M"
+            ) == "https://www.reddit.com/r/analog/s/SxUF0FKk9M"
 
         def fake_share_download(command, **_):
             target = Path(command[command.index("--directory") + 1]) / "remote-name.jpg"
@@ -855,13 +882,19 @@ with TemporaryDirectory() as directory:
             }))
             return CompletedProcess(command, 0, "", "")
 
-        with patch.object(kakera.subprocess, "run", side_effect=fake_share_download) as share_run:
+        with (
+            patch.object(
+                kakera, "resolve_reddit_share_url",
+                return_value="https://www.reddit.com/r/AnalogNudes/comments/1abcxyz/title",
+            ),
+            patch.object(kakera.subprocess, "run", side_effect=fake_share_download) as share_run,
+        ):
             saved, message = kakera.save(
                 "https://www.reddit.com/r/AnalogNudes/s/0zmwMgxI3q",
                 None, vault / "Clippings", vault / "assets",
             )
         assert saved, message
-        assert "r/AnalogNudes/s/0zmwMgxI3q" in share_run.call_args.args[0][-1]
+        assert share_run.call_args.args[0][-1].endswith("/comments/1abcxyz/title")
         assert (vault / "assets" / "reddit" / "reddit-1abcxyz-01.jpg").is_file()
         share_note = next((vault / "Clippings").glob("*.md"))
         assert '"https://www.reddit.com/r/AnalogNudes/comments/1abcxyz/title"' in share_note.read_text()

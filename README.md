@@ -701,7 +701,7 @@ non-service/manual tags and adding current queue or CLI tags.
 | --- | --- | --- |
 | Instagram | `https://www.instagram.com/p/ID/`, `/reel/ID/`, `/reels/ID/`, `/tv/ID/` | Uses gallery-dl; login cookies may be required. `/reels/` is the same post as `/reel/`. Capture keeps images only. Transient Telegram Delivery can send MP4 video. |
 | Twitter/X | `https://x.com/USER/status/ID`, `https://x.com/i/web/status/ID`, `twitter.com/.../status/ID`, optional `/photo/N` or `/video/N` | Individual status only; Capture saves images and ignores videos. Transient Telegram Delivery can send MP4 video. |
-| Reddit | `https://redd.it/ID`, Reddit `/comments/ID/` or `/gallery/ID/` URLs, app share `/r/SUB/s/CODE` | Uses gallery-dl; configure Reddit OAuth when required. Capture keeps images only. A `/s/` share link is followed to the post. Transient Telegram Delivery can send MP4 video. |
+| Reddit | `https://redd.it/ID`, Reddit `/comments/ID/` or `/gallery/ID/` URLs, app share `/r/SUB/s/CODE` | Uses gallery-dl with the Reddit OAuth API; configure `reddit.client_id` / `user_agent` and run `reddit-oauth` when required. Capture keeps images only. A `/s/` share link is resolved to the post before fetch. Transient Telegram Delivery can send MP4 video. |
 | RedNote | `http(s)://xhslink.com/m/ID` or `/o/ID`, public `xiaohongshu.com/explore/ID` or `/item/ID` | Reads public page data and images; no login-only posts. Capture does not download video; Transient Telegram Delivery sends covers then the MP4. |
 
 ## Output
