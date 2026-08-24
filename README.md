@@ -556,7 +556,7 @@ Inbox/Todoist/watch, or fetch remote images embedded in an existing note.
 | `telegram intake already running` | Another `kakera telegram` process holds the Intake lock. |
 | `Telegram getUpdates conflict` | Another process is calling `getUpdates` on this bot token (a second watch, another machine, or the chat-ID snippet). Stop the other consumer. |
 | `Telegram request failed: …` | Telegram returned that description; the token is valid enough to talk to the API, but this call was rejected. |
-| `PHOTO_INVALID_DIMENSIONS` | Telegram rejects inline photos whose width+height exceed 10,000 or whose aspect ratio exceeds 20:1. Kakera sends those files as documents instead and keeps the full images in the Capture. |
+| `PHOTO_INVALID_DIMENSIONS` | Telegram rejects inline photos whose width+height exceed 10,000 or whose aspect ratio exceeds 20:1. Kakera resizes a copy for Telegram and keeps the original in the Capture; if resize is impossible it sends a document. |
 | Existing-note has no eligible images | Check Markdown/Obsidian embed paths, image type, vault containment, and the 10 MB limit. Remote, data, missing, ambiguous, and outside-vault images are omitted. |
 | Transient URL has no eligible images or video | Check that the complete fetch produced supported local images or an MP4; partial/failed fetches are never sent. WebM and other non-MP4 video is ignored. |
 | Ambiguous note or image | Use the listed relative note path or a qualified embed/path. |
@@ -731,7 +731,8 @@ vault/
 ```
 
 Notes contain Obsidian properties, source text when available, and relative
-image links. Repeated captures of the same post deduplicate same-content
+image links. Attachments that exceed Telegram photo limits are stored as a
+reduced JPEG; the original download is not kept. Repeated captures of the same post deduplicate same-content
 Attachments. If another post uses the same title, the later note includes its
 post ID and service in the filename, for example
 `Post title - POST_ID - Instagram.md`.

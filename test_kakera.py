@@ -513,6 +513,37 @@ with TemporaryDirectory() as directory:
         )[0]
         assert (root / "downloads" / "Photo caption - XYZ_789 - Instagram.md").exists()
 
+    incoming = root / "original.jpg"
+    incoming.write_bytes(b"\xff\xd8\xff\xe0original")
+    fitted = root / "fitted.jpg"
+    fitted.write_bytes(b"\xff\xd8\xff\xe0fitted")
+    source = {
+        "name": "instagram-FIT",
+        "service": "instagram",
+        "valid": [(incoming, ".jpg")],
+    }
+    with (
+        patch.object(kakera, "telegram_photo_dimension_ok", side_effect=lambda path: path != incoming),
+        patch.object(kakera, "telegram_photo_fit", return_value=fitted),
+    ):
+        stored = kakera.store_source_images(source, root / "downloads", root / "attachments")
+    assert [path.name for path in stored] == ["instagram-FIT-01.jpg"]
+    assert stored[0].read_bytes() == b"\xff\xd8\xff\xe0fitted"
+    existing_oversize = root / "attachments" / "instagram" / "instagram-FIT-01.jpg"
+    existing_oversize.write_bytes(b"\xff\xd8\xff\xe0original")
+    replacement = root / "fitted2.jpg"
+    replacement.write_bytes(b"\xff\xd8\xff\xe0again")
+    with (
+        patch.object(
+            kakera, "telegram_photo_dimension_ok",
+            side_effect=lambda path: path not in {incoming, existing_oversize},
+        ),
+        patch.object(kakera, "telegram_photo_fit", return_value=replacement),
+    ):
+        stored = kakera.store_source_images(source, root / "downloads", root / "attachments")
+    assert [path.name for path in stored] == ["instagram-FIT-01.jpg"]
+    assert stored[0].read_bytes() == b"\xff\xd8\xff\xe0again"
+
     login_error = CompletedProcess(
         [], 1, "", "[instagram][error] HTTP redirect to login page (https://www.instagram.com/accounts/login/)"
     )
@@ -2428,16 +2459,47 @@ with TemporaryDirectory() as directory:
         assert "sendDocument" in dimension_calls[2].full_url
         assert "sending as document" in warning.getvalue()
         huge_requests = []
-        with patch.object(
-            kakera, "urlopen",
-            side_effect=lambda request, **_kwargs: (
-                huge_requests.append(request) or TelegramResponse(
-                    b'{"ok":true,"result":{"message_id":11}}'
-                )
+        with (
+            patch.object(kakera, "telegram_photo_fit", return_value=None),
+            patch.object(
+                kakera, "urlopen",
+                side_effect=lambda request, **_kwargs: (
+                    huge_requests.append(request) or TelegramResponse(
+                        b'{"ok":true,"result":{"message_id":11}}'
+                    )
+                ),
             ),
         ):
             assert kakera.telegram_send("-1", "caption", [huge]) == [11]
         assert "sendDocument" in huge_requests[0].full_url
+        huge_requests.clear()
+        with (
+            patch.object(kakera, "telegram_photo_fit", return_value=image),
+            patch.object(
+                kakera, "urlopen",
+                side_effect=lambda request, **_kwargs: (
+                    huge_requests.append(request) or TelegramResponse(
+                        b'{"ok":true,"result":{"message_id":12}}'
+                    )
+                ),
+            ),
+        ):
+            assert kakera.telegram_send("-1", "caption", [huge]) == [12]
+        assert "sendPhoto" in huge_requests[0].full_url
+        with TemporaryDirectory() as fit_dir:
+            assert kakera.telegram_photo_fit(huge, Path(fit_dir)) is None
+        try:
+            from PIL import Image as PILImage
+        except ImportError:
+            PILImage = None
+        if PILImage is not None:
+            tall = vault / "tall.jpg"
+            PILImage.new("RGB", (200, 9900), (12, 24, 36)).save(tall, "JPEG")
+            with TemporaryDirectory() as fit_dir:
+                fitted = kakera.telegram_photo_fit(tall, Path(fit_dir))
+                assert fitted is not None
+                assert kakera.telegram_photo_dimension_ok(fitted)
+                assert fitted.stat().st_size <= kakera.TELEGRAM_MAX_BYTES
 
         resend = notes / "resend.md"
         resend.write_text('---\nkakera: {"shared":{"telegram":{"-1":[3]}}}\n---\n![](../photo.jpg)\n')

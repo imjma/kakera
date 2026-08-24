@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["gallery-dl>=1.32.9,<2"]
+# dependencies = ["gallery-dl>=1.32.9,<2", "pillow>=10,<12"]
 # ///
 
 import argparse
@@ -1375,6 +1375,56 @@ def telegram_photo_dimension_ok(path: Path) -> bool:
     return max(width, height) / min(width, height) <= TELEGRAM_MAX_PHOTO_RATIO
 
 
+def telegram_photo_fit(path: Path, directory: Path) -> Path | None:
+    """Return a JPEG that fits Telegram photo limits, or None. Does not modify path."""
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:
+        return None
+    resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
+    try:
+        with Image.open(path) as opened:
+            image = ImageOps.exif_transpose(opened)
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+            width, height = image.size
+            if width < 1 or height < 1:
+                return None
+            long_side, short_side = max(width, height), min(width, height)
+            if short_side and long_side / short_side > TELEGRAM_MAX_PHOTO_RATIO:
+                new_long = int(short_side * TELEGRAM_MAX_PHOTO_RATIO)
+                if width >= height:
+                    left = (width - new_long) // 2
+                    image = image.crop((left, 0, left + new_long, height))
+                else:
+                    top = (height - new_long) // 2
+                    image = image.crop((0, top, width, top + new_long))
+                width, height = image.size
+            if width + height > TELEGRAM_MAX_PHOTO_SIDE_SUM:
+                scale = TELEGRAM_MAX_PHOTO_SIDE_SUM / (width + height)
+                image = image.resize(
+                    (max(1, int(width * scale)), max(1, int(height * scale))),
+                    resample,
+                )
+            directory.mkdir(parents=True, exist_ok=True)
+            target = directory / f"{path.stem}-{os.urandom(4).hex()}.jpg"
+            for quality in (85, 70, 55, 40):
+                image.save(target, "JPEG", quality=quality, optimize=True)
+                if target.stat().st_size <= TELEGRAM_MAX_BYTES and telegram_photo_dimension_ok(target):
+                    return target
+            for factor in (0.75, 0.5, 0.35):
+                smaller = image.resize(
+                    (max(1, int(image.size[0] * factor)), max(1, int(image.size[1] * factor))),
+                    resample,
+                )
+                smaller.save(target, "JPEG", quality=70, optimize=True)
+                if target.stat().st_size <= TELEGRAM_MAX_BYTES and telegram_photo_dimension_ok(target):
+                    return target
+    except (OSError, ValueError, SyntaxError):
+        return None
+    return None
+
+
 def video_extension(path: Path) -> str | None:
     with path.open("rb") as file:
         data = file.read(16)
@@ -2415,44 +2465,69 @@ def telegram_send(chat_id: str, caption: str, images: list[Path], token: str | N
     if not 1 <= len(images) <= TELEGRAM_MAX_IMAGES:
         raise ValueError("Telegram delivery requires 1 to 10 images")
     token = token or telegram_token()
-    visual, documents = [], []
-    for path in images:
-        if _telegram_item_kind(path) == "document":
-            documents.append(path)
-        else:
-            visual.append(path)
-    ids: list[int] = []
-    pending = list(visual)
-    while pending:
-        try:
-            ids.extend(_telegram_send_group(
-                chat_id, caption if not ids else "", pending, token,
-            ))
-            break
-        except ValueError as error:
-            match = TELEGRAM_PHOTO_ITEM.search(str(error))
-            if not match:
-                raise
-            index = int(match.group(1)) - 1
-            if not 0 <= index < len(pending):
-                raise
-            moved = pending.pop(index)
-            documents.append(moved)
-            print(
-                f"warning: Telegram photo dimensions invalid, sending as document: {moved.name}",
-                file=sys.stderr,
-            )
-            if not pending:
+    with tempfile.TemporaryDirectory(prefix="kakera-telegram-") as scratch_dir:
+        scratch = Path(scratch_dir)
+        visual, documents = [], []
+        for path in images:
+            if _telegram_item_kind(path) == "document":
+                if video_extension(path):
+                    documents.append(path)
+                    continue
+                resized = telegram_photo_fit(path, scratch)
+                if resized is not None:
+                    print(f"warning: resized {path.name} for Telegram photo limits", file=sys.stderr)
+                    visual.append(resized)
+                else:
+                    documents.append(path)
+            else:
+                visual.append(path)
+        ids: list[int] = []
+        pending = list(visual)
+        while pending:
+            try:
+                ids.extend(_telegram_send_group(
+                    chat_id, caption if not ids else "", pending, token,
+                ))
                 break
-    if documents:
-        for start in range(0, len(documents), TELEGRAM_MAX_IMAGES):
-            chunk = documents[start:start + TELEGRAM_MAX_IMAGES]
-            ids.extend(_telegram_send_group(
-                chat_id, caption if not ids else "", chunk, token, as_document=True,
-            ))
-    if not ids:
-        raise ValueError("Telegram delivery requires 1 to 10 images")
-    return ids
+            except ValueError as error:
+                match = TELEGRAM_PHOTO_ITEM.search(str(error))
+                if not match:
+                    raise
+                index = int(match.group(1)) - 1
+                if not 0 <= index < len(pending):
+                    raise
+                moved = pending.pop(index)
+                if moved.parent == scratch:
+                    documents.append(moved)
+                    print(
+                        f"warning: Telegram photo dimensions invalid, sending as document: {moved.name}",
+                        file=sys.stderr,
+                    )
+                else:
+                    resized = telegram_photo_fit(moved, scratch)
+                    if resized is not None:
+                        print(
+                            f"warning: resized {moved.name} for Telegram photo limits",
+                            file=sys.stderr,
+                        )
+                        pending.insert(index, resized)
+                    else:
+                        documents.append(moved)
+                        print(
+                            f"warning: Telegram photo dimensions invalid, sending as document: {moved.name}",
+                            file=sys.stderr,
+                        )
+                if not pending:
+                    break
+        if documents:
+            for start in range(0, len(documents), TELEGRAM_MAX_IMAGES):
+                chunk = documents[start:start + TELEGRAM_MAX_IMAGES]
+                ids.extend(_telegram_send_group(
+                    chat_id, caption if not ids else "", chunk, token, as_document=True,
+                ))
+        if not ids:
+            raise ValueError("Telegram delivery requires 1 to 10 images")
+        return ids
 
 
 def publish_telegram_note(note: Path, vault: Path, *, selected_url: str | None = None,
@@ -2917,6 +2992,21 @@ def store_source_images(source: dict, notes: Path, attachment_root: Path) -> lis
         return _store_source_images(source, notes, attachment_root)
 
 
+def _attachment_payload(incoming: Path, extension: str, scratch: Path) -> tuple[Path, str]:
+    if not image_extension(incoming):
+        return incoming, extension
+    try:
+        oversized = incoming.stat().st_size > TELEGRAM_MAX_BYTES
+    except OSError:
+        return incoming, extension
+    if not oversized and telegram_photo_dimension_ok(incoming):
+        return incoming, extension
+    fitted = telegram_photo_fit(incoming, scratch)
+    if fitted is None:
+        return incoming, extension
+    return fitted, ".jpg"
+
+
 def _store_source_images(source: dict, notes: Path, attachment_root: Path) -> list[Path]:
     service, name = source["service"], source["name"]
     attachments = attachment_root / service
@@ -2948,64 +3038,94 @@ def _store_source_images(source: dict, notes: Path, attachment_root: Path) -> li
     numbers = [int(match.group(1)) for path in existing
                if (match := re.fullmatch(rf"{re.escape(name)}-(\d+)\.[^.]+", path.name))]
     next_number = max(numbers, default=0) + 1
-    for incoming, extension in source["valid"]:
-        try:
-            source_hash = digest(incoming)
-        except OSError as error:
-            source["error"] = f"cannot read downloaded image: {error}"
-            break
-        if source_hash in hashes:
-            continue
-        try:
-            source["_created_attachment_dir"] = not attachments.exists()
-            attachments.mkdir(parents=True, exist_ok=True)
-        except OSError as error:
-            source["error"] = f"cannot create attachment folder: {error}"
-            break
-        temporary_name = None
-        published = False
-        try:
-            for _attempt in range(1000):
-                target = attachments / f"{name}-{next_number:02}{extension}"
-                with tempfile.NamedTemporaryFile(
-                    prefix=f".{name}-", suffix=extension, dir=attachments, delete=False
-                ) as target_file:
-                    temporary_name = Path(target_file.name)
-                    with incoming.open("rb") as source_file:
-                        shutil.copyfileobj(source_file, target_file)
-                    target_file.flush()
-                    os.fsync(target_file.fileno())
-                try:
-                    os.link(temporary_name, target)
-                except FileExistsError:
-                    temporary_name.unlink(missing_ok=True)
-                    temporary_name = None
-                    try:
-                        if digest(target) == source_hash:
-                            if target not in existing:
-                                existing.append(target)
-                            hashes.add(source_hash)
-                            published = True
-                            break
-                    except OSError:
-                        pass
-                    next_number += 1
-                    continue
-                temporary_name.unlink(missing_ok=True)
-                existing.append(target)
-                hashes.add(source_hash)
-                next_number += 1
-                published = True
+    with tempfile.TemporaryDirectory(prefix="kakera-fit-") as scratch_dir:
+        scratch = Path(scratch_dir)
+        for incoming, extension in source["valid"]:
+            try:
+                payload, extension = _attachment_payload(incoming, extension, scratch)
+                source_hash = digest(payload)
+            except OSError as error:
+                source["error"] = f"cannot read downloaded image: {error}"
                 break
+            if source_hash in hashes:
+                continue
+            try:
+                source["_created_attachment_dir"] = not attachments.exists()
+                attachments.mkdir(parents=True, exist_ok=True)
+            except OSError as error:
+                source["error"] = f"cannot create attachment folder: {error}"
+                break
+            replace = None
+            for path in existing:
+                try:
+                    if path.stat().st_size > TELEGRAM_MAX_BYTES or not telegram_photo_dimension_ok(path):
+                        replace = path
+                        break
+                except OSError:
+                    continue
+            temporary_name = None
+            published = False
+            try:
+                for _attempt in range(1000):
+                    target = (
+                        replace.with_suffix(extension) if replace is not None
+                        else attachments / f"{name}-{next_number:02}{extension}"
+                    )
+                    with tempfile.NamedTemporaryFile(
+                        prefix=f".{name}-", suffix=extension, dir=attachments, delete=False
+                    ) as target_file:
+                        temporary_name = Path(target_file.name)
+                        with payload.open("rb") as source_file:
+                            shutil.copyfileobj(source_file, target_file)
+                        target_file.flush()
+                        os.fsync(target_file.fileno())
+                    if replace is not None:
+                        try:
+                            hashes.discard(digest(replace))
+                        except OSError:
+                            pass
+                        if target != replace:
+                            replace.unlink(missing_ok=True)
+                            if replace in existing:
+                                existing.remove(replace)
+                        os.replace(temporary_name, target)
+                        temporary_name = None
+                        if target not in existing:
+                            existing.append(target)
+                        hashes.add(source_hash)
+                        published = True
+                        break
+                    try:
+                        os.link(temporary_name, target)
+                    except FileExistsError:
+                        temporary_name.unlink(missing_ok=True)
+                        temporary_name = None
+                        try:
+                            if digest(target) == source_hash:
+                                if target not in existing:
+                                    existing.append(target)
+                                hashes.add(source_hash)
+                                published = True
+                                break
+                        except OSError:
+                            pass
+                        next_number += 1
+                        continue
+                    temporary_name.unlink(missing_ok=True)
+                    existing.append(target)
+                    hashes.add(source_hash)
+                    next_number += 1
+                    published = True
+                    break
+                if not published:
+                    source["error"] = "cannot reserve a unique attachment name"
+            except OSError as error:
+                source["error"] = f"cannot save attachments: {error}"
+            finally:
+                if temporary_name:
+                    temporary_name.unlink(missing_ok=True)
             if not published:
-                source["error"] = "cannot reserve a unique attachment name"
-        except OSError as error:
-            source["error"] = f"cannot save attachments: {error}"
-        finally:
-            if temporary_name:
-                temporary_name.unlink(missing_ok=True)
-        if not published:
-            break
+                break
     source["images"] = existing
     return source["images"]
 

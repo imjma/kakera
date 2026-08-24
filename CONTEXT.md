@@ -53,7 +53,7 @@ A Markdown note inside Kakera's configured Obsidian notes folder. A Source Note 
 _Avoid_: Capture, Source Note
 
 **Attachment**:
-An image referenced by a Source Note and stored under its Source Service in the local or configured Obsidian attachments folder. The same file may be referenced or reused across Captures.
+An image referenced by a Source Note and stored under its Source Service in the local or configured Obsidian attachments folder. The same file may be referenced or reused across Captures. A source image that exceeds Telegram photo limits is stored reduced to those limits.
 _Avoid_: Asset, media file, downloaded image
 
 **Queue Report**:
