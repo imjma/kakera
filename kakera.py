@@ -1564,7 +1564,10 @@ def parse_rednote(page: str, source: str) -> tuple[str, dict, list[str], str | N
         raise ValueError("RedNote page did not include public note data")
     try:
         state = json.loads(re.sub(r"(?<=:)undefined(?=[,}])", "null", match.group(1)))
-        note = next(iter(state["note"]["noteDetailMap"].values()))["note"]
+        if "note" in state:
+            note = next(iter(state["note"]["noteDetailMap"].values()))["note"]
+        else:
+            note = state["noteData"]["data"]["noteData"]
         if not isinstance(note, dict):
             raise ValueError("RedNote page data has changed")
         note_id = note.get("noteId")
@@ -1572,7 +1575,7 @@ def parse_rednote(page: str, source: str) -> tuple[str, dict, list[str], str | N
         raise ValueError("RedNote page data has changed") from error
 
     images = [
-        image.get("urlDefault") or next(
+        image.get("urlDefault") or image.get("url") or next(
             (item.get("url") for item in image.get("infoList", []) if item.get("url")), ""
         )
         for image in note.get("imageList", [])
@@ -1587,7 +1590,7 @@ def parse_rednote(page: str, source: str) -> tuple[str, dict, list[str], str | N
     metadata = {
         "title": note.get("title"),
         "description": note.get("desc"),
-        "author": user.get("nickname"),
+        "author": user.get("nickname") or user.get("nickName"),
         "author_url": (
             f"https://www.xiaohongshu.com/user/profile/{user['userId']}"
             if user.get("userId") else None
@@ -1619,7 +1622,8 @@ def _rednote_fetch_bytes(url: str, headers: dict, limit: int, label: str) -> byt
 
 
 def download_rednote(url: str, directory: Path, include_video: bool = False) -> tuple[str, dict]:
-    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) Kakera/0.1"}
+    headers = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) "
+                             "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"}
     try:
         with urlopen(Request(rednote_fetch_url(url), headers=headers), timeout=30) as response:
             page = response.read(5 * 1024 * 1024 + 1)
@@ -1873,9 +1877,12 @@ def write_note(
             author_url = f"https://www.instagram.com/{username}/"
         elif service == "twitter":
             author_url = metadata.get("author_url") or f"https://x.com/{username}"
-        else:
+        elif service == "reddit":
             author_url = f"https://www.reddit.com/user/{username}/"
-        properties.append(f"author_url: {json.dumps(author_url, ensure_ascii=False)}")
+        else:
+            author_url = metadata.get("author_url")
+        if author_url:
+            properties.append(f"author_url: {json.dumps(author_url, ensure_ascii=False)}")
     elif metadata.get("author_url"):
         properties.append(f"author_url: {json.dumps(metadata['author_url'], ensure_ascii=False)}")
     if published:

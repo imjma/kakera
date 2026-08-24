@@ -180,6 +180,14 @@ assert rednote_metadata["post_url"] == "http://xhslink.com/o/ABC"
 assert rednote_images == ["https://example.com/image"]
 assert rednote_video is None
 
+rednote_mobile_page = """<script>window.__INITIAL_STATE__={"global":{"value":undefined},"noteData":{"data":{"noteData":{"noteId":"abc123","title":"A note","desc":"Caption","time":1784807339000,"user":{"userId":"user1","nickName":"Artist"},"imageList":[{"url":"http://example.com/image"}]}}}}</script>"""
+mobile_name, mobile_metadata, mobile_images, _ = parse_rednote(
+    rednote_mobile_page, "http://xhslink.com/m/ABC"
+)
+assert mobile_name == "rednote-abc123"
+assert mobile_metadata["author"] == "Artist"
+assert mobile_images == ["https://example.com/image"]
+
 unsafe_rednote_page = rednote_page.replace('"noteId":"abc123"', '"noteId":"../escape"')
 unsafe_name, _, _, _ = parse_rednote(unsafe_rednote_page, "http://xhslink.com/o/ABC")
 unsafe_name_again, _, _, _ = parse_rednote(unsafe_rednote_page, "http://xhslink.com/o/ABC")
@@ -212,6 +220,9 @@ with TemporaryDirectory() as directory:
     webm.write_bytes(b"\x1a\x45\xdf\xa3" + b"\x00" * 12)
     jpeg = probe / "still.jpg"
     jpeg.write_bytes(b"\xff\xd8\xff\xe0image")
+    rednote_note = probe / "rednote.md"
+    kakera.write_note(rednote_note, "http://xhslink.com/o/ABC", [jpeg], rednote_metadata, "rednote")
+    assert 'author_url: "https://www.xiaohongshu.com/user/profile/user1"' in rednote_note.read_text()
     assert kakera.video_extension(mp4) == ".mp4" and kakera.image_extension(mp4) is None
     assert kakera.image_extension(heic) == ".heic" and kakera.video_extension(heic) is None
     assert kakera.image_extension(avif) == ".avif" and kakera.video_extension(avif) is None
