@@ -62,6 +62,7 @@ TELEGRAM_LONG_POLL = 60
 TELEGRAM_MAX_IMAGES = 10
 TELEGRAM_MAX_BYTES = 10 * 1024 * 1024
 TELEGRAM_MAX_VIDEO_BYTES = 50 * 1024 * 1024
+TELEGRAM_MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
 TELEGRAM_MAX_PHOTO_SIDE_SUM = 10000
 TELEGRAM_MAX_PHOTO_RATIO = 20
 TELEGRAM_PHOTO_ITEM = re.compile(
@@ -2163,7 +2164,7 @@ def _telegram_note_images(note: Path, vault: Path, image_index: dict[str, list[P
     ))
     vault = vault.resolve()
     result, seen = [], set()
-    oversized = oversized_dimensions = overflow = 0
+    oversized = overflow = 0
     for embed in embeds:
         token = embed.group(0)
         if token.startswith("![["):
@@ -2193,11 +2194,8 @@ def _telegram_note_images(note: Path, vault: Path, image_index: dict[str, list[P
                 if not image_extension(resolved):
                     continue
                 seen.add(resolved)
-                if resolved.stat().st_size > TELEGRAM_MAX_BYTES:
+                if resolved.stat().st_size > TELEGRAM_MAX_DOCUMENT_BYTES:
                     oversized += 1
-                    continue
-                if not telegram_photo_dimension_ok(resolved):
-                    oversized_dimensions += 1
                     continue
                 if len(result) == TELEGRAM_MAX_IMAGES:
                     overflow += 1
@@ -2207,9 +2205,7 @@ def _telegram_note_images(note: Path, vault: Path, image_index: dict[str, list[P
             except OSError:
                 continue
     if oversized:
-        print(f"warning: skipped {oversized} Telegram image(s) over 10 MB", file=sys.stderr)
-    if oversized_dimensions:
-        print(f"warning: skipped {oversized_dimensions} Telegram image(s) over photo dimension limits", file=sys.stderr)
+        print(f"warning: skipped {oversized} Telegram image(s) over 50 MB", file=sys.stderr)
     if overflow:
         print(f"warning: skipped {overflow} eligible Telegram image(s) after the first 10", file=sys.stderr)
     return result
@@ -2290,7 +2286,7 @@ def _telegram_count_label(paths: list[Path]) -> str:
 
 def _telegram_filter_images(paths: list[Path], *, allow_video: bool = False) -> list[Path]:
     result, seen = [], set()
-    oversized_images = oversized_videos = oversized_dimensions = overflow = 0
+    oversized_images = oversized_videos = overflow = 0
     for path in paths:
         try:
             path = path.resolve()
@@ -2298,15 +2294,12 @@ def _telegram_filter_images(paths: list[Path], *, allow_video: bool = False) -> 
                 continue
             seen.add(path)
             video = bool(video_extension(path))
-            limit = TELEGRAM_MAX_VIDEO_BYTES if video else TELEGRAM_MAX_BYTES
+            limit = TELEGRAM_MAX_VIDEO_BYTES if video else TELEGRAM_MAX_DOCUMENT_BYTES
             if path.stat().st_size > limit:
                 if video:
                     oversized_videos += 1
                 else:
                     oversized_images += 1
-                continue
-            if not video and not telegram_photo_dimension_ok(path):
-                oversized_dimensions += 1
                 continue
             if len(result) >= TELEGRAM_MAX_IMAGES:
                 overflow += 1
@@ -2315,9 +2308,7 @@ def _telegram_filter_images(paths: list[Path], *, allow_video: bool = False) -> 
         except OSError:
             continue
     if oversized_images:
-        print(f"warning: skipped {oversized_images} Telegram image(s) over 10 MB", file=sys.stderr)
-    if oversized_dimensions:
-        print(f"warning: skipped {oversized_dimensions} Telegram image(s) over photo dimension limits", file=sys.stderr)
+        print(f"warning: skipped {oversized_images} Telegram image(s) over 50 MB", file=sys.stderr)
     if oversized_videos:
         print(f"warning: skipped {oversized_videos} Telegram video(s) over 50 MB", file=sys.stderr)
     if overflow:
@@ -2326,7 +2317,8 @@ def _telegram_filter_images(paths: list[Path], *, allow_video: bool = False) -> 
     return result
 
 
-def _telegram_multipart(method: str, chat_id: str, caption: str, images: list[Path]) -> tuple[bytes, str]:
+def _telegram_multipart(method: str, chat_id: str, caption: str, images: list[Path],
+                        *, as_document: bool = False) -> tuple[bytes, str]:
     boundary = f"kakera{hashlib.sha256(os.urandom(16)).hexdigest()}"
     chunks = []
     def field(name: str, value: str):
@@ -2342,10 +2334,15 @@ def _telegram_multipart(method: str, chat_id: str, caption: str, images: list[Pa
         path = images[0]
         data = path.read_bytes()
         chunks.extend((f"--{boundary}\r\nContent-Disposition: form-data; name=\"video\"; filename=\"video{_telegram_file_extension(path)}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode(), data, b"\r\n"))
+    elif method == "sendDocument":
+        field("caption", caption)
+        path = images[0]
+        data = path.read_bytes()
+        chunks.extend((f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"file{_telegram_file_extension(path)}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode(), data, b"\r\n"))
     else:
         media = []
         for i, path in enumerate(images):
-            kind = _telegram_file_kind(path) or "photo"
+            kind = "document" if as_document else (_telegram_file_kind(path) or "photo")
             item = {"type": kind, "media": f"attach://file{i}"}
             if i == 0:
                 item["caption"] = caption
@@ -2357,61 +2354,105 @@ def _telegram_multipart(method: str, chat_id: str, caption: str, images: list[Pa
     return b"".join(chunks), boundary
 
 
-def telegram_send(chat_id: str, caption: str, images: list[Path], token: str | None = None) -> list[int]:
-    remaining = list(images)
-    last_error: ValueError | None = None
-    while remaining:
-        if not 1 <= len(remaining) <= TELEGRAM_MAX_IMAGES:
-            raise ValueError("Telegram delivery requires 1 to 10 images")
-        if len(remaining) == 1:
-            method = "sendVideo" if video_extension(remaining[0]) else "sendPhoto"
-        else:
-            method = "sendMediaGroup"
-        body, boundary = _telegram_multipart(method, chat_id, caption, remaining)
-        token = token or telegram_token()
-        timeout = 120 if any(video_extension(path) for path in remaining) else 30
-        request = Request(
-            f"{TELEGRAM_API}/bot{token}/{method}", data=body,
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}, method="POST",
-        )
+def _telegram_item_kind(path: Path) -> str:
+    if video_extension(path):
+        return "video"
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return "photo"
+    if size <= TELEGRAM_MAX_BYTES and telegram_photo_dimension_ok(path):
+        return "photo"
+    return "document"
+
+
+def _telegram_send_group(
+    chat_id: str, caption: str, images: list[Path], token: str, *, as_document: bool = False,
+) -> list[int]:
+    if not 1 <= len(images) <= TELEGRAM_MAX_IMAGES:
+        raise ValueError("Telegram delivery requires 1 to 10 images")
+    if as_document:
+        method = "sendDocument" if len(images) == 1 else "sendMediaGroup"
+    elif len(images) == 1:
+        method = "sendVideo" if video_extension(images[0]) else "sendPhoto"
+    else:
+        method = "sendMediaGroup"
+    body, boundary = _telegram_multipart(
+        method, chat_id, caption, images, as_document=as_document,
+    )
+    timeout = 120 if any(video_extension(path) for path in images) else 30
+    request = Request(
+        f"{TELEGRAM_API}/bot{token}/{method}", data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}, method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            if getattr(response, "status", 200) >= 400:
+                raise OSError("Telegram HTTP error")
+            payload = json.loads(response.read() or b"{}")
+    except HTTPError as error:
         try:
-            with urlopen(request, timeout=timeout) as response:
-                if getattr(response, "status", 200) >= 400:
-                    raise OSError("Telegram HTTP error")
-                payload = json.loads(response.read() or b"{}")
-        except HTTPError as error:
-            try:
-                payload = json.loads(error.read() or b"{}")
-            except (OSError, json.JSONDecodeError, TypeError):
-                payload = {}
-            last_error = _telegram_api_error(method, payload, error)
-        except (OSError, json.JSONDecodeError, TypeError) as error:
-            last_error = _telegram_api_error(method, error=error)
+            payload = json.loads(error.read() or b"{}")
+        except (OSError, json.JSONDecodeError, TypeError):
+            payload = {}
+        raise _telegram_api_error(method, payload, error) from error
+    except (OSError, json.JSONDecodeError, TypeError) as error:
+        raise _telegram_api_error(method, error=error) from error
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        raise _telegram_api_error(method, payload)
+    result = payload.get("result")
+    messages = result if method == "sendMediaGroup" else [result]
+    if (not isinstance(messages, list) or len(messages) != len(images)
+            or any(not isinstance(item, dict)
+                   or isinstance(item.get("message_id"), bool)
+                   or not isinstance(item.get("message_id"), int)
+                   or item["message_id"] <= 0 for item in messages)):
+        raise ValueError("Telegram returned an invalid delivery response")
+    return [item["message_id"] for item in messages]
+
+
+def telegram_send(chat_id: str, caption: str, images: list[Path], token: str | None = None) -> list[int]:
+    if not 1 <= len(images) <= TELEGRAM_MAX_IMAGES:
+        raise ValueError("Telegram delivery requires 1 to 10 images")
+    token = token or telegram_token()
+    visual, documents = [], []
+    for path in images:
+        if _telegram_item_kind(path) == "document":
+            documents.append(path)
         else:
-            last_error = None
-            if not isinstance(payload, dict) or payload.get("ok") is not True:
-                last_error = _telegram_api_error(method, payload)
-            else:
-                result = payload.get("result")
-                messages = result if method == "sendMediaGroup" else [result]
-                if (not isinstance(messages, list) or len(messages) != len(remaining)
-                        or any(not isinstance(item, dict)
-                               or isinstance(item.get("message_id"), bool)
-                               or not isinstance(item.get("message_id"), int)
-                               or item["message_id"] <= 0 for item in messages)):
-                    raise ValueError("Telegram returned an invalid delivery response")
-                return [item["message_id"] for item in messages]
-        match = TELEGRAM_PHOTO_ITEM.search(str(last_error or ""))
-        if not match or len(remaining) < 2:
+            visual.append(path)
+    ids: list[int] = []
+    pending = list(visual)
+    while pending:
+        try:
+            ids.extend(_telegram_send_group(
+                chat_id, caption if not ids else "", pending, token,
+            ))
             break
-        index = int(match.group(1)) - 1
-        if not 0 <= index < len(remaining):
-            break
-        skipped = remaining.pop(index)
-        print(f"warning: skipped Telegram image with invalid dimensions: {skipped.name}", file=sys.stderr)
-    if last_error is not None:
-        raise last_error
-    raise ValueError("Telegram delivery requires 1 to 10 images")
+        except ValueError as error:
+            match = TELEGRAM_PHOTO_ITEM.search(str(error))
+            if not match:
+                raise
+            index = int(match.group(1)) - 1
+            if not 0 <= index < len(pending):
+                raise
+            moved = pending.pop(index)
+            documents.append(moved)
+            print(
+                f"warning: Telegram photo dimensions invalid, sending as document: {moved.name}",
+                file=sys.stderr,
+            )
+            if not pending:
+                break
+    if documents:
+        for start in range(0, len(documents), TELEGRAM_MAX_IMAGES):
+            chunk = documents[start:start + TELEGRAM_MAX_IMAGES]
+            ids.extend(_telegram_send_group(
+                chat_id, caption if not ids else "", chunk, token, as_document=True,
+            ))
+    if not ids:
+        raise ValueError("Telegram delivery requires 1 to 10 images")
+    return ids
 
 
 def publish_telegram_note(note: Path, vault: Path, *, selected_url: str | None = None,

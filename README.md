@@ -556,7 +556,7 @@ Inbox/Todoist/watch, or fetch remote images embedded in an existing note.
 | `telegram intake already running` | Another `kakera telegram` process holds the Intake lock. |
 | `Telegram getUpdates conflict` | Another process is calling `getUpdates` on this bot token (a second watch, another machine, or the chat-ID snippet). Stop the other consumer. |
 | `Telegram request failed: …` | Telegram returned that description; the token is valid enough to talk to the API, but this call was rejected. |
-| `PHOTO_INVALID_DIMENSIONS` | Telegram rejects photos whose width+height exceed 10,000 or whose aspect ratio exceeds 20:1. Kakera skips those images, sends the rest, and keeps the full files in the Capture. |
+| `PHOTO_INVALID_DIMENSIONS` | Telegram rejects inline photos whose width+height exceed 10,000 or whose aspect ratio exceeds 20:1. Kakera sends those files as documents instead and keeps the full images in the Capture. |
 | Existing-note has no eligible images | Check Markdown/Obsidian embed paths, image type, vault containment, and the 10 MB limit. Remote, data, missing, ambiguous, and outside-vault images are omitted. |
 | Transient URL has no eligible images or video | Check that the complete fetch produced supported local images or an MP4; partial/failed fetches are never sent. WebM and other non-MP4 video is ignored. |
 | Ambiguous note or image | Use the listed relative note path or a qualified embed/path. |

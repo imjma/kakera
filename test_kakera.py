@@ -2207,7 +2207,7 @@ with TemporaryDirectory() as directory:
         path = vault / f"limit-{index}.jpg"
         path.write_bytes(b"\xff\xd8\xfflimit")
         if index == 0:
-            path.open("ab").truncate(kakera.TELEGRAM_MAX_BYTES + 1)
+            path.open("ab").truncate(kakera.TELEGRAM_MAX_DOCUMENT_BYTES + 1)
         limited.append(path)
     limited_note = notes / "limited.md"
     limited_note.write_text("\n".join(f"![[{path.name}]]" for path in limited) + "\n")
@@ -2217,7 +2217,7 @@ with TemporaryDirectory() as directory:
             limited_note, vault, kakera._telegram_image_index(vault)
         )
     assert selected == [path.resolve() for path in limited[1:11]]
-    assert "skipped 1 Telegram image(s) over 10 MB" in warning.getvalue()
+    assert "skipped 1 Telegram image(s) over 50 MB" in warning.getvalue()
     assert "skipped 2 eligible Telegram image(s) after the first 10" in warning.getvalue()
 
     huge = vault / "huge-scan.jpg"
@@ -2228,10 +2228,9 @@ with TemporaryDirectory() as directory:
     assert kakera.image_dimensions(huge) == (9000, 2000)
     assert not kakera.telegram_photo_dimension_ok(huge)
     assert kakera.telegram_photo_dimension_ok(image)
-    dim_warning = io.StringIO()
-    with redirect_stderr(dim_warning):
-        assert kakera._telegram_filter_images([huge, image]) == [image.resolve()]
-    assert "photo dimension limits" in dim_warning.getvalue()
+    assert kakera._telegram_filter_images([huge, image]) == [huge.resolve(), image.resolve()]
+    assert kakera._telegram_item_kind(huge) == "document"
+    assert kakera._telegram_item_kind(image) == "photo"
 
     config = root / "telegram.json"
     config.write_text(json.dumps({
@@ -2418,13 +2417,27 @@ with TemporaryDirectory() as directory:
                 return TelegramResponse(
                     b'{"ok":false,"description":"Bad Request: failed to send message #2 with the error message \\"PHOTO_INVALID_DIMENSIONS\\""}'
                 )
-            return TelegramResponse(b'{"ok":true,"result":{"message_id":9}}')
+            if "sendPhoto" in request.full_url:
+                return TelegramResponse(b'{"ok":true,"result":{"message_id":9}}')
+            return TelegramResponse(b'{"ok":true,"result":{"message_id":10}}')
         warning = io.StringIO()
         with patch.object(kakera, "urlopen", side_effect=dimension_urlopen), redirect_stderr(warning):
-            assert kakera.telegram_send("-1", "caption", [image, duplicate]) == [9]
+            assert kakera.telegram_send("-1", "caption", [image, duplicate]) == [9, 10]
         assert "sendMediaGroup" in dimension_calls[0].full_url
         assert "sendPhoto" in dimension_calls[1].full_url
-        assert "invalid dimensions" in warning.getvalue()
+        assert "sendDocument" in dimension_calls[2].full_url
+        assert "sending as document" in warning.getvalue()
+        huge_requests = []
+        with patch.object(
+            kakera, "urlopen",
+            side_effect=lambda request, **_kwargs: (
+                huge_requests.append(request) or TelegramResponse(
+                    b'{"ok":true,"result":{"message_id":11}}'
+                )
+            ),
+        ):
+            assert kakera.telegram_send("-1", "caption", [huge]) == [11]
+        assert "sendDocument" in huge_requests[0].full_url
 
         resend = notes / "resend.md"
         resend.write_text('---\nkakera: {"shared":{"telegram":{"-1":[3]}}}\n---\n![](../photo.jpg)\n')
