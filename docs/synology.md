@@ -245,11 +245,29 @@ exit
 
 Continue only when neither file operation reports `Permission denied`.
 
-If Reddit OAuth is required, authorize it once after the build. Its refresh token persists under `state/`, and Kakera updates the private deployment config:
+If Reddit OAuth is required, authorize it once after the build. gallery-dl listens on port 6414 inside the container; publish that port so the callback can be delivered. The refresh token persists under `state/`, and Kakera updates the private deployment config:
 
 ```sh
-sudo docker compose --profile workers run --rm --no-deps todoist --reddit-oauth YOUR_REDDIT_USERNAME
+cd /volume1/docker/kakera/deploy/synology
+sudo docker compose --profile workers run --rm --no-deps -p 6414:6414 \
+  todoist --reddit-oauth YOUR_REDDIT_USERNAME
 ```
+
+Leave that session running. Open the printed Reddit authorize URL on your computer, approve access, and wait until the browser lands on `http://localhost:6414/?state=...&code=...` (it will fail to load). Copy the address bar, drop the `#_` at the end, replace `localhost` with the NAS LAN IP, and fetch it from the same computer:
+
+```sh
+curl -g 'http://NAS_LAN_IP:6414/?state=...&code=...'
+```
+
+If the port was not published and the oauth process is still waiting, deliver the query to that same container from the NAS (the `#_` fragment is not sent):
+
+```sh
+sudo docker ps
+sudo docker exec CONTAINER python -c \
+  "from urllib.request import urlopen; print(urlopen('http://127.0.0.1:6414/?state=...&code=...').read())"
+```
+
+A used or expired `code` cannot be reused; run `--reddit-oauth` again and complete the callback once. Do not leave 6414 published on the long-running workers.
 
 ## Link and verify Obsidian Sync
 

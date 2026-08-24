@@ -2220,6 +2220,19 @@ with TemporaryDirectory() as directory:
     assert "skipped 1 Telegram image(s) over 10 MB" in warning.getvalue()
     assert "skipped 2 eligible Telegram image(s) after the first 10" in warning.getvalue()
 
+    huge = vault / "huge-scan.jpg"
+    huge.write_bytes(
+        b"\xff\xd8\xff\xc0\x00\x0b\x08" + (2000).to_bytes(2, "big") + (9000).to_bytes(2, "big")
+        + b"\x01\x01\x11\x00\xff\xd9"
+    )
+    assert kakera.image_dimensions(huge) == (9000, 2000)
+    assert not kakera.telegram_photo_dimension_ok(huge)
+    assert kakera.telegram_photo_dimension_ok(image)
+    dim_warning = io.StringIO()
+    with redirect_stderr(dim_warning):
+        assert kakera._telegram_filter_images([huge, image]) == [image.resolve()]
+    assert "photo dimension limits" in dim_warning.getvalue()
+
     config = root / "telegram.json"
     config.write_text(json.dumps({
         "obsidian": {"vault": str(vault), "notes": "Kakera", "attachments": "attachments"},
@@ -2398,6 +2411,20 @@ with TemporaryDirectory() as directory:
                 assert str(error) == "Telegram request failed: Bad Request: chat not found"
             else:
                 raise AssertionError("accepted Telegram chat-not-found")
+        dimension_calls = []
+        def dimension_urlopen(request, **_kwargs):
+            dimension_calls.append(request)
+            if len(dimension_calls) == 1:
+                return TelegramResponse(
+                    b'{"ok":false,"description":"Bad Request: failed to send message #2 with the error message \\"PHOTO_INVALID_DIMENSIONS\\""}'
+                )
+            return TelegramResponse(b'{"ok":true,"result":{"message_id":9}}')
+        warning = io.StringIO()
+        with patch.object(kakera, "urlopen", side_effect=dimension_urlopen), redirect_stderr(warning):
+            assert kakera.telegram_send("-1", "caption", [image, duplicate]) == [9]
+        assert "sendMediaGroup" in dimension_calls[0].full_url
+        assert "sendPhoto" in dimension_calls[1].full_url
+        assert "invalid dimensions" in warning.getvalue()
 
         resend = notes / "resend.md"
         resend.write_text('---\nkakera: {"shared":{"telegram":{"-1":[3]}}}\n---\n![](../photo.jpg)\n')
