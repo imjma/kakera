@@ -239,7 +239,7 @@ long-polls and rejects `--interval`.
 array of numeric Telegram user IDs whose private messages may become Transient
 Telegram Deliveries. Missing, empty, or non-numeric values refuse to start.
 `telegram.report_user_id` is the one allowed user who receives Inbox and Todoist
-capture-failure reports in private chat. It must be listed in
+Queue Reports in private chat. It must be listed in
 `allowed_user_ids`. Omit it to skip those reports.
 
 `obsidian.vault` is the existing vault directory; `~` is expanded. `notes`,
@@ -364,18 +364,18 @@ https://www.instagram.com/p/ABC/
 from @imjma
 ```
 
-Inbox and Todoist capture failures are reported in the private chat of
+Inbox and Todoist Queue Reports are sent in the private chat of
 `telegram.report_user_id`. The queue watcher sends that text itself; it does
 not go through `kakera telegram --watch`, and a second Intake watcher is still
-refused. Identical failures are not re-reported until the reason changes or a
-later capture succeeds. Missing `report_user_id` or Telegram configuration
+refused. Identical failures are not re-reported in this watch until the reason changes
+or a later capture succeeds. Missing `report_user_id` or Telegram configuration
 skips the report without changing capture behavior. Named Instagram Failed
 Sources (`Instagram session expired` and `Instagram post is followers-only`)
 are one report per class listing only URLs not already sent in this watch,
-even when another source in the group saved. That set is stored in
-`kakera.report-state.json` (next to the Telegram Intake state), so a Docker
-restart does not print or Telegram the same failures again. Intake replies to
-the sender with the same reason.
+even when another source in the group saved. A restart treats still-failing
+items as new. A watcher that cannot read Inbox or Todoist logs the error and
+does not send a Queue Report. Intake replies to the sender with the same
+reason.
 
 The last consumed Telegram `update_id` is stored in `kakera.telegram-state.json`
 next to `kakera.json` (gitignored). A second `kakera telegram --watch` fails
@@ -549,7 +549,7 @@ Inbox/Todoist/watch, or fetch remote images embedded in an existing note.
 | `TELEGRAM_BOT_TOKEN is not set` | Export the token in the shell running Kakera; never add it to JSON. |
 | Invalid `telegram.chat_id` | Use the exact numeric ID from `getUpdates`, including its minus sign; no `@username` or topic ID. |
 | Invalid `telegram.allowed_user_ids` | Non-empty array of numeric user IDs; required for `kakera telegram`. A private-chat ID from the snippet above is the user ID. |
-| Invalid `telegram.report_user_id` | A single numeric user ID listed in `allowed_user_ids`; omit the key to skip Inbox/Todoist failure reports. |
+| Invalid `telegram.report_user_id` | A single numeric user ID listed in `allowed_user_ids`; omit the key to skip Inbox/Todoist Queue Reports. |
 | Bot cannot send | Recheck channel **Post Messages** or group send-message/send-photo permissions. |
 | `getUpdates` is empty | Send a fresh group/channel event or DM; check whether another consumer or webhook has consumed updates. |
 | `Telegram webhook is set` | Delete the webhook on this bot token; Intake uses `getUpdates` only. |

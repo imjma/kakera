@@ -56,12 +56,16 @@ _Avoid_: Capture, Source Note
 An image referenced by a Source Note and stored under its Source Service in the local or configured Obsidian attachments folder. The same file may be referenced or reused across Captures.
 _Avoid_: Asset, media file, downloaded image
 
+**Queue Report**:
+A private Telegram message to one configured allowed user about an Inbox or Todoist outcome of Submitted Sources: an unsuccessful group, a named Instagram Failed Source, a failed Transient Telegram Delivery, or a Capture or Delivery that could not be marked complete. It is not a message that Inbox or Todoist could not be read.
+_Avoid_: Alert, notification, watch error, Telegram error, capture report
+
 **Inbox**:
-An Obsidian note containing unchecked Markdown tasks whose URLs are waiting to become Captures, or Transient Telegram Deliveries when requested with `share/telegram-only`. A parent task and nested subtasks may form one ordered composition. Successful groups are checked; unsuccessful groups remain pending. An expired Instagram session or followers-only Instagram post is reported in one configured allowed user's private chat even when the group is saved; other unsuccessful groups are reported there only while they remain pending.
+An Obsidian note containing unchecked Markdown tasks whose URLs are waiting to become Captures, or Transient Telegram Deliveries when requested with `share/telegram-only`. A parent task and nested subtasks may form one ordered composition. Successful groups are checked; unsuccessful groups remain pending. Named Instagram Failed Sources produce a Queue Report even when the group is saved; other unsuccessful groups produce one while they remain pending; a group that cannot be checked after success also produces one.
 _Avoid_: Queue database, link file, Todoist
 
 **Todoist**:
-An external project of open tasks whose URLs are waiting to become Captures, or Transient Telegram Deliveries when requested with `share/telegram-only`, the same role as the Inbox. A parent task and nested subtasks may form one ordered composition; native labels become Capture Tags except `share/telegram-only`, which is a queue request and is not persisted. Unsuccessful groups remain open. An expired Instagram session or followers-only Instagram post is reported in one configured allowed user's private chat even when the group is saved; other unsuccessful groups are reported there only while they remain open.
+An external project of open tasks whose URLs are waiting to become Captures, or Transient Telegram Deliveries when requested with `share/telegram-only`, the same role as the Inbox. A parent task and nested subtasks may form one ordered composition; native labels become Capture Tags except `share/telegram-only`, which is a queue request and is not persisted. Unsuccessful groups remain open. Named Instagram Failed Sources produce a Queue Report even when the group is saved; other unsuccessful groups produce one while they remain open; a group that cannot be closed after success also produces one.
 _Avoid_: Inbox, queue label
 
 **Telegram Intake**:

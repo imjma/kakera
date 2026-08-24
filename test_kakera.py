@@ -15,6 +15,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import kakera
+
+kakera.telegram_send_text = lambda *_args, **_kwargs: None
+
 from kakera import (
     canonical_url,
     capture_id,
@@ -882,7 +885,6 @@ with TemporaryDirectory() as directory:
     with (
         patch.object(kakera, "save", return_value=(True, "saved")) as save,
         patch.object(kakera.time, "sleep", side_effect=change_then_stop),
-        patch.object(kakera, "REPORT_STATE", root / "kakera.report-state.json"),
     ):
         assert watch_inbox(watched, None, vault / "Clippings", vault / "assets", tags=["future"]) == 0
     assert save.call_count == 1
@@ -2530,8 +2532,7 @@ with TemporaryDirectory() as directory:
     watched = root / "watched.md"
     watched.write_text("# Inbox\n")
     with patch.object(kakera, "process_inbox", return_value=0) as process, \
-         patch.object(kakera.time, "sleep", side_effect=KeyboardInterrupt), \
-         patch.object(kakera, "REPORT_STATE", root / "kakera.report-state.json"):
+         patch.object(kakera.time, "sleep", side_effect=KeyboardInterrupt):
         assert kakera.watch_inbox(watched, None, notes, attachments, tags=["share/telegram"]) == 0
     assert process.call_args.args[-1] == ["share/telegram"]
 
@@ -3508,28 +3509,6 @@ with TemporaryDirectory() as directory:
         assert kakera.process_todoist(None, notes, attachments, reported=logged) == 1
     assert log_output.getvalue().count("Instagram session expired") == 1
 
-    report_file = root / "kakera.report-state.json"
-    with patch.object(kakera, "REPORT_STATE", report_file):
-        kakera.save_report_state(logged)
-        restored = kakera.load_report_state()
-    silent = io.StringIO()
-    replies.clear()
-    with (
-        patch.object(kakera, "CONFIG", config),
-        patch.dict(kakera.os.environ, {
-            "TODOIST_API_TOKEN": "token",
-            "TELEGRAM_BOT_TOKEN": "secret",
-        }),
-        patch.object(kakera, "todoist_task_pages", return_value=iter([[session_task]])),
-        patch.object(kakera, "todoist_request", return_value={}),
-        patch.object(kakera, "save", return_value=(False, kakera.INSTAGRAM_SESSION_EXPIRED)),
-        patch.object(kakera, "telegram_send_text", side_effect=record_reply),
-        redirect_stdout(silent),
-    ):
-        assert kakera.process_todoist(None, notes, attachments, reported=restored) == 1
-    assert replies == []
-    assert "Instagram session expired" not in silent.getvalue()
-
     mixed_task = {
         "id": "mix",
         "content": "https://x.com/a/status/ok\nhttps://www.instagram.com/p/PRIV/",
@@ -3560,6 +3539,7 @@ with TemporaryDirectory() as directory:
 
     watch_replies = []
     ticks = [0]
+    watch_log = io.StringIO()
 
     def fail_then_stop(_interval):
         ticks[0] += 1
@@ -3575,11 +3555,31 @@ with TemporaryDirectory() as directory:
         patch.object(kakera, "process_todoist", side_effect=ValueError("Todoist request failed")),
         patch.object(kakera.time, "sleep", side_effect=fail_then_stop),
         patch.object(kakera, "telegram_send_text", side_effect=lambda *args: watch_replies.append(args)),
-        patch.object(kakera, "REPORT_STATE", root / "kakera.report-state.json"),
         redirect_stdout(io.StringIO()),
-        redirect_stderr(io.StringIO()),
+        redirect_stderr(watch_log),
     ):
         assert kakera.watch_todoist(None, notes, attachments) == 0
-    assert [(chat, text) for chat, text, _token in watch_replies] == [
-        ("99", "Todoist: Todoist request failed"),
-    ]
+    assert watch_replies == []
+    assert watch_log.getvalue().count("Todoist request failed") == 1
+
+    inbox_replies = []
+    inbox_ticks = [0]
+    inbox_log = io.StringIO()
+
+    def inbox_fail_then_stop(_interval):
+        inbox_ticks[0] += 1
+        if inbox_ticks[0] >= 2:
+            raise KeyboardInterrupt
+
+    with (
+        patch.object(kakera, "CONFIG", config),
+        patch.dict(kakera.os.environ, {"TELEGRAM_BOT_TOKEN": "secret"}),
+        patch.object(kakera, "read_inbox", side_effect=OSError("unreadable")),
+        patch.object(kakera.time, "sleep", side_effect=inbox_fail_then_stop),
+        patch.object(kakera, "telegram_send_text", side_effect=lambda *args: inbox_replies.append(args)),
+        redirect_stdout(io.StringIO()),
+        redirect_stderr(inbox_log),
+    ):
+        assert kakera.watch_inbox(inbox, None, notes, attachments) == 0
+    assert inbox_replies == []
+    assert inbox_log.getvalue().count("unreadable") == 1
