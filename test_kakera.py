@@ -172,6 +172,15 @@ with TemporaryDirectory() as directory:
         replace_text(temporary, destination)
     assert destination.read_text() == "updated"
 
+with TemporaryDirectory() as directory:
+    root = Path(directory)
+    filename = kakera.note_filename({"description": "x" * 400}, "instagram") + ".md"
+    assert len(filename.encode()) == 243
+    note = root / filename
+    kakera.write_atomic_note(note, "capture")
+    assert note.read_text() == "capture"
+    assert not list(root.glob("*.tmp"))
+
 rednote_page = """<script>window.__INITIAL_STATE__={"global":{"value":undefined},"note":{"noteDetailMap":{"id":{"note":{"noteId":"abc123","title":"A note","desc":"Caption","time":1784807339000,"user":{"userId":"user1","nickname":"Artist"},"imageList":[{"urlDefault":"http://example.com/image"}]}}}}}</script>"""
 rednote_name, rednote_metadata, rednote_images, rednote_video = parse_rednote(rednote_page, "http://xhslink.com/o/ABC")
 assert rednote_name == "rednote-abc123"

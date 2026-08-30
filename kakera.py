@@ -1825,7 +1825,7 @@ def note_tags(note: Path) -> list[str]:
 def write_atomic_note(note: Path, content: str) -> None:
     note.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{note.name}.", suffix=".tmp", dir=note.parent
+        prefix=".kakera-", suffix=".tmp", dir=note.parent
     )
     temporary = Path(temporary_name)
     try:
