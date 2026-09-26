@@ -3912,3 +3912,153 @@ with TemporaryDirectory() as directory:
     finally:
         server.shutdown()
         server.server_close()
+
+with TemporaryDirectory() as directory:
+    notes = Path(directory)
+    cover = "https://cdn.example/cover.jpg"
+    name = capture_id(cover)
+    metadata = {"title": "ridge", "post_url": cover}
+    ordinary = notes / "diary.md"
+    ordinary.write_text(f'---\nimage: "{cover}"\n---\nkeep this\n')
+    tagged_only = notes / "tagged.md"
+    tagged_only.write_text(
+        '---\n'
+        f'image: "{cover}"\n'
+        "tags:\n"
+        '  - "image"\n'
+        "---\n"
+        "still mine\n"
+    )
+    chosen = kakera.note_path(notes, name, metadata, cover)
+    assert chosen not in {ordinary, tagged_only}
+    assert kakera.composed_note_path(
+        notes, {"name": name, "service": "image", "url": cover, "metadata": metadata},
+    ) not in {ordinary, tagged_only}
+    write_note(chosen, cover, [], metadata, "image")
+    written = chosen.read_text()
+    assert 'image: "https://cdn.example/cover.jpg"' in written
+    assert '\n  - "image"\n' in written
+    assert ordinary.read_text().endswith("keep this\n")
+    assert tagged_only.read_text().endswith("still mine\n")
+    assert kakera.note_path(notes, name, metadata, cover) == chosen
+    assert kakera.composed_note_path(
+        notes, {"name": name, "service": "image", "url": cover, "metadata": metadata},
+    ) == chosen
+
+with TemporaryDirectory() as directory:
+    root = Path(directory)
+    notes = root / "notes"
+    notes.mkdir()
+    image_note = notes / "ridge.md"
+    stored = "https://cdn.example/ridge.jpg?utm_source=x"
+    selector = "https://cdn.example/ridge.jpg"
+    image_note.write_text(f'---\nimage: "{stored}"\n---\n')
+    matches, selected = kakera._telegram_note_candidates(selector, notes, root)
+    assert matches == [image_note.resolve()], matches
+    assert selected == selector
+
+def _deny_image_dns(*_args, **_kwargs):
+    raise AssertionError("resolved DNS for an image host")
+
+def _deny_image_open(*_args, **_kwargs):
+    raise AssertionError("opened an image URL")
+
+with TemporaryDirectory() as directory:
+    root = Path(directory)
+    blocked = (
+        "https://10.0.0.5/private.jpg",
+        "https://169.254.169.254/link.jpg",
+        "https://127.0.0.1/loop.jpg",
+        "https://240.0.0.1/reserved.jpg",
+        "https://[::1]/loop.jpg",
+    )
+    with (
+        patch.object(kakera.socket, "getaddrinfo", side_effect=_deny_image_dns),
+        patch.object(kakera, "build_opener", side_effect=_deny_image_open),
+    ):
+        for blocked_url in blocked:
+            found, error = kakera.fetch_source(
+                blocked_url, None, None, None, root / "blocked", capture_id(blocked_url),
+            )
+            assert found is None
+            assert error == "image URL points at a private address", (blocked_url, error)
+
+    class _FixtureAdmitted:
+        def open(self, request, timeout=30):
+            assert request.full_url == "http://127.0.0.1/ridge.jpg"
+            raise kakera.URLError("fixture admitted")
+
+    with (
+        patch.object(kakera.socket, "getaddrinfo", side_effect=_deny_image_dns),
+        patch.object(kakera, "build_opener", return_value=_FixtureAdmitted()),
+    ):
+        found, error = kakera.fetch_source(
+            "http://127.0.0.1/ridge.jpg", None, None, None, root / "fixture",
+            capture_id("http://127.0.0.1/ridge.jpg"),
+        )
+    assert found is None
+    assert error == "image request failed: <urlopen error fixture admitted>", error
+
+    def _private_dns(host, *_args, **_kwargs):
+        assert host == "internal.example"
+        return [(kakera.socket.AF_INET, kakera.socket.SOCK_STREAM, 6, "", ("10.0.0.5", 0))]
+
+    with (
+        patch.object(kakera.socket, "getaddrinfo", side_effect=_private_dns),
+        patch.object(kakera, "build_opener", side_effect=_deny_image_open),
+    ):
+        found, error = kakera.fetch_source(
+            "https://internal.example/ridge.jpg", None, None, None, root / "dns",
+            capture_id("https://internal.example/ridge.jpg"),
+        )
+    assert found is None
+    assert error == "image URL points at a private address", error
+
+    def _public_dns(host, *_args, **_kwargs):
+        assert host == "cdn.example"
+        return [(kakera.socket.AF_INET, kakera.socket.SOCK_STREAM, 6, "", ("8.8.8.8", 0))]
+
+    class _Admitted:
+        def open(self, request, timeout=30):
+            raise kakera.URLError("admitted")
+
+    with (
+        patch.object(kakera.socket, "getaddrinfo", side_effect=_public_dns),
+        patch.object(kakera, "build_opener", return_value=_Admitted()),
+    ):
+        found, error = kakera.fetch_source(
+            "https://cdn.example/ridge.jpg", None, None, None, root / "public",
+            capture_id("https://cdn.example/ridge.jpg"),
+        )
+    assert found is None
+    assert error == "image request failed: <urlopen error admitted>", error
+
+    handler = kakera._ImageRedirectHandler("cdn.example")
+    request = kakera.Request("https://cdn.example/ridge.jpg")
+    with patch.object(kakera.socket, "getaddrinfo", side_effect=_deny_image_dns):
+        for private_target in (
+            "https://10.0.0.5/secret.jpg",
+            "https://169.254.169.254/latest.jpg",
+            "https://127.0.0.1/secret.jpg",
+            "https://240.0.0.1/secret.jpg",
+        ):
+            try:
+                handler.redirect_request(request, None, 302, "Found", {}, private_target)
+            except ValueError as error:
+                assert str(error) == "image URL redirected to a private address", (private_target, error)
+            else:
+                raise AssertionError(private_target)
+    with patch.object(kakera.socket, "getaddrinfo", side_effect=_private_dns):
+        try:
+            handler.redirect_request(
+                request, None, 302, "Found", {}, "https://internal.example/secret.jpg",
+            )
+        except ValueError as error:
+            assert str(error) == "image URL redirected to a private address", error
+        else:
+            raise AssertionError("allowed a redirect that resolves to a private address")
+    with patch.object(kakera.socket, "getaddrinfo", side_effect=_public_dns):
+        followed = handler.redirect_request(
+            request, None, 302, "Found", {}, "https://cdn.example/other.jpg",
+        )
+    assert followed.full_url == "https://cdn.example/other.jpg"

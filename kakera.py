@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -298,6 +299,33 @@ def _direct_image_url(url: str) -> bool:
     return _loopback_http_image(url)
 
 
+def _blocked_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (
+        address.is_private or address.is_loopback or address.is_link_local
+        or address.is_multicast or address.is_reserved or address.is_unspecified
+    )
+
+
+def _blocked_resolved_name(host: str) -> bool:
+    try:
+        records = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return True
+    if not records:
+        return True
+    for record in records:
+        text = record[4][0]
+        if isinstance(text, str):
+            text = text.split("%", 1)[0]
+        try:
+            address = ipaddress.ip_address(text)
+        except ValueError:
+            return True
+        if _blocked_ip(address):
+            return True
+    return False
+
+
 def _blocked_redirect_host(host: str | None) -> bool:
     if _loopback_host(host):
         return True
@@ -306,11 +334,8 @@ def _blocked_redirect_host(host: str | None) -> bool:
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
-        return False
-    return (
-        address.is_private or address.is_loopback or address.is_link_local
-        or address.is_multicast or address.is_reserved or address.is_unspecified
-    )
+        return _blocked_resolved_name(host)
+    return _blocked_ip(address)
 
 
 class _ImageRedirectHandler(HTTPRedirectHandler):
@@ -340,6 +365,8 @@ def _direct_image_source(url: str, directory: Path, name: str) -> dict:
     parts = urlsplit(url)
     if not _direct_image_url(url):
         raise ValueError("only HTTPS URLs are supported")
+    if not _loopback_http_image(url) and _blocked_redirect_host((parts.hostname or "").lower()):
+        raise ValueError("image URL points at a private address")
     directory.mkdir(parents=True, exist_ok=True)
     request = Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; Kakera/0.1)"})
     opener = build_opener(_ImageRedirectHandler((parts.hostname or "").lower()))
@@ -1821,7 +1848,8 @@ def note_path(notes: Path, name: str, metadata: dict, source: str | None = None)
                             except json.JSONDecodeError:
                                 value = ""
                             if isinstance(value, str) and canonical_url(value) == canonical_url(source_url):
-                                return path
+                                if property_key != "image" or _kakera_source_note(text, service):
+                                    return path
                             break
             if f"{name}-" in text:
                 return path
@@ -1901,14 +1929,7 @@ def _strip_yaml_comment(line: str) -> str:
     return line.rstrip()
 
 
-def note_tags(note: Path) -> list[str]:
-    """Read supported YAML tag serializations without loading arbitrary YAML."""
-    try:
-        frontmatter = frontmatter_body(note.read_text())
-    except OSError:
-        return []
-    if frontmatter is None:
-        return []
+def _frontmatter_tag_values(frontmatter: str) -> list[str]:
     lines = frontmatter.splitlines()
     values = []
     for index, raw_line in enumerate(lines):
@@ -1933,8 +1954,37 @@ def note_tags(note: Path) -> list[str]:
                 continue
             break
         break
-    return [tag for tag in normalize_tags(values, warn=True)
+    return values
+
+
+def note_tags(note: Path) -> list[str]:
+    """Read supported YAML tag serializations without loading arbitrary YAML."""
+    try:
+        frontmatter = frontmatter_body(note.read_text())
+    except OSError:
+        return []
+    if frontmatter is None:
+        return []
+    return [tag for tag in normalize_tags(_frontmatter_tag_values(frontmatter), warn=True)
             if tag.casefold() not in SOURCE_SERVICES]
+
+
+def _kakera_source_note(text: str, service: str) -> bool:
+    frontmatter = frontmatter_body(text)
+    if frontmatter is None:
+        return False
+    keys = set()
+    for raw_line in frontmatter.splitlines():
+        line = _strip_yaml_comment(raw_line)
+        if not line or line[0].isspace():
+            continue
+        key, separator, _raw_value = line.partition(":")
+        if separator and key.strip():
+            keys.add(key.strip())
+    if "title" not in keys or "created" not in keys:
+        return False
+    tags = normalize_tags(_frontmatter_tag_values(frontmatter), warn=True)
+    return service.casefold() in {tag.casefold() for tag in tags}
 
 
 def write_atomic_note(note: Path, content: str) -> None:
@@ -2714,7 +2764,7 @@ def _telegram_note_candidates(selector: str, notes: Path, vault: Path,
         for path in files:
             values, _ = _telegram_frontmatter(path.read_text())
             for key, value in values.items():
-                if key in {"source", "instagram", "twitter", "reddit", "xhslink", "url"} and isinstance(value, str) and re.match(r"^https?://", value, re.I) and canonical_url(value) == canonical_url(selector):
+                if key in {"source", "instagram", "twitter", "reddit", "xhslink", "image", "url"} and isinstance(value, str) and re.match(r"^https?://", value, re.I) and canonical_url(value) == canonical_url(selector):
                     matches.append(path)
                     break
         return matches, normalize_instagram_post_url(selector) if matches else None
@@ -3276,7 +3326,8 @@ def composed_note_path(notes: Path, primary: dict) -> Path:
     property_key = source_link_property(primary["service"])
     for path in notes.glob("*.md"):
         try:
-            frontmatter = frontmatter_body(path.read_text())
+            text = path.read_text()
+            frontmatter = frontmatter_body(text)
             if frontmatter is None:
                 continue
             for line in frontmatter.splitlines():
@@ -3287,7 +3338,8 @@ def composed_note_path(notes: Path, primary: dict) -> Path:
                     except json.JSONDecodeError:
                         value = ""
                     if isinstance(value, str) and canonical_url(value) == canonical:
-                        return path
+                        if property_key != "image" or _kakera_source_note(text, primary["service"]):
+                            return path
                     break
         except (OSError, ValueError):
             continue
