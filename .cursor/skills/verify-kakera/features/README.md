@@ -48,3 +48,4 @@ Keep implementation details out of the map. Name only user paths, stable handles
 - [Compose submitted URLs](./compose-capture.md) covers one composed Source Note and the refusal when no source produces an image.
 - [Add capture tags](./capture-tags.md) covers applying a tag and aborting on an invalid tag before any capture.
 - [Process the inbox](./process-inbox.md) covers creating a missing inbox, an empty inbox, and an unchecked task that stays unchecked.
+- [Store one image by URL](./single-image-url.md) covers an Obsidian capture of a local image fixture and the same capture with `--share telegram` when the bot token is unset.
