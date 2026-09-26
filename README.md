@@ -2,12 +2,12 @@
 
 `Kakera` (かけら, 欠片) is Japanese for a fragment, piece, or shard. Here, it reflects preserving or sharing small pieces of source posts.
 
-Kakera saves images and source metadata from Instagram, Twitter/X, Reddit, and
-public RedNote posts as local Captures with portable Markdown Source Notes. It
-can write ordinary local folders or the configured folders inside an Obsidian
-vault, and can publish a Telegram Delivery from a current Capture, an existing
-note, a submitted URL, or a Source Service URL in an allowed user's private
-Telegram message.
+Kakera saves images and source metadata from Instagram, Twitter/X, Reddit,
+public RedNote posts, and one HTTPS image URL as local Captures with portable
+Markdown Source Notes. It can write ordinary local folders or the configured
+folders inside an Obsidian vault, and can publish a Telegram Delivery from a
+current Capture, an existing note, a submitted URL, or a Source Service URL in
+an allowed user's private Telegram message.
 
 ## Requirements
 
@@ -73,7 +73,7 @@ and OAuth commands do not accept URLs.
 
 | Command | Purpose |
 | --- | --- |
-| `./kakera URL [URL ...]` | Capture URL(s) into the configured Obsidian folders. |
+| `./kakera URL [URL ...]` | Capture URL(s) into the configured Obsidian folders. A path that ends in `.jpg`, `.jpeg`, `.png`, `.gif`, `.webp`, `.avif`, `.heic`, `.tif`, or `.tiff` stores that one image. |
 | `./kakera local URL [URL ...]` | Capture URL(s) into `downloads/` and `attachments/`. |
 | `./kakera --compose URL [URL ...]` | Compose URL(s) into one Source Note; the first URL stays primary. |
 | `./kakera local --compose URL [URL ...]` | Compose into local `downloads/` and `attachments/`. |

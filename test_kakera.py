@@ -3767,3 +3767,148 @@ with TemporaryDirectory() as directory:
         assert kakera.watch_inbox(inbox, None, notes, attachments) == 0
     assert inbox_replies == []
     assert inbox_log.getvalue().count("unreadable") == 1
+
+image_url = "https://cdn.example/photos/ridge.jpg?utm_source=x&w=100"
+assert capture_id(image_url) == "image-" + hashlib.sha256(
+    canonical_url(image_url).encode()
+).hexdigest()[:12]
+assert capture_id(image_url) == capture_id("https://cdn.example/photos/ridge.jpg?w=100")
+assert capture_id("https://cdn.example/photos/ridge.JPG").startswith("image-")
+try:
+    capture_id("https://example.com/not-a-post")
+except ValueError as error:
+    assert str(error) == "supported sources are Instagram, Twitter/X, Reddit, and RedNote", error
+else:
+    raise AssertionError("accepted a non-image URL")
+try:
+    capture_id("http://cdn.example/photos/ridge.jpg")
+except ValueError as error:
+    assert str(error) == "only HTTPS URLs are supported", error
+else:
+    raise AssertionError("accepted a public HTTP image URL")
+try:
+    capture_id("https://www.instagram.com/photo.jpg")
+except ValueError as error:
+    assert str(error) == "Instagram URL must be an individual post", error
+else:
+    raise AssertionError("classified an Instagram host as an image URL")
+assert capture_id("http://127.0.0.1/ridge.jpg").startswith("image-")
+
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 20
+
+
+class _ImageFixture(BaseHTTPRequestHandler):
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/off.jpg":
+            self.send_response(302)
+            self.send_header("Location", "http://example.com/ridge.jpg")
+            self.end_headers()
+            return
+        if path == "/go.jpg":
+            self.send_response(302)
+            self.send_header("Location", f"http://{self.headers['Host']}/ridge.jpg")
+            self.end_headers()
+            return
+        if path == "/page.jpg":
+            body = b"<html>not an image</html>"
+        elif path == "/ridge.jpg":
+            body = JPEG
+        else:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format, *_args):
+        return
+
+
+with TemporaryDirectory() as directory:
+    root = Path(directory)
+    notes = root / "notes"
+    attachments = root / "attachments"
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ImageFixture)
+    port = server.server_address[1]
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        ridge = f"http://127.0.0.1:{port}/ridge.jpg"
+        calls = []
+
+        def forbid_gallery(command, **_kwargs):
+            calls.append(command)
+            raise AssertionError(command)
+
+        with patch.object(kakera.subprocess, "run", side_effect=forbid_gallery):
+            ok, message = kakera.save(ridge, None, notes, attachments)
+        assert ok, message
+        assert message == "saved 1 image(s)", message
+        assert calls == []
+        note = next(notes.glob("*.md"))
+        text = note.read_text()
+        assert 'image: "http://127.0.0.1:' in text
+        assert f"{port}/ridge.jpg" in text
+        assert '\n  - "image"\n' in text
+        assert "ridge - Image" in text
+        stored = list((attachments / "image").glob("image-*-01.jpg"))
+        assert len(stored) == 1, stored
+        assert stored[0].read_bytes() == JPEG
+        with patch.object(kakera.subprocess, "run", side_effect=forbid_gallery):
+            again, again_message = kakera.save(ridge, None, notes, attachments)
+        assert again, again_message
+        assert list((attachments / "image").glob("image-*-*.jpg")) == stored
+        page = f"http://127.0.0.1:{port}/page.jpg"
+        failed, failure = kakera.save(page, None, notes, attachments)
+        assert not failed, failure
+        assert failure == "no supported images found", failure
+        assert list(notes.glob("*.md")) == [note]
+        off = f"http://127.0.0.1:{port}/off.jpg"
+        redirected, redirect_message = kakera.fetch_source(
+            off, None, None, None, root / "off", kakera.capture_id(off),
+        )
+        assert redirected is None, redirected
+        assert redirect_message == "image URL redirected off the local fixture", redirect_message
+        gone = f"http://127.0.0.1:{port}/go.jpg"
+        followed, follow_error = kakera.fetch_source(
+            gone, None, None, None, root / "go", kakera.capture_id(gone),
+        )
+        assert follow_error is None, follow_error
+        assert followed["valid"][0][0].read_bytes() == JPEG
+        assert followed["url"] == gone
+        vault = root / "vault"
+        vault_notes = vault / "kakera"
+        vault_attachments = vault / "attachments"
+        config = root / "kakera.json"
+        config.write_text(json.dumps({
+            "browser": "none",
+            "obsidian": {
+                "vault": str(vault),
+                "notes": "kakera",
+                "attachments": "attachments",
+            },
+            "telegram": {"chat_id": "-1001234567890"},
+        }))
+        shared = f"http://127.0.0.1:{port}/ridge.jpg?w=2"
+        with (
+            patch.object(kakera, "CONFIG", config),
+            patch.dict(kakera.os.environ, {"TELEGRAM_BOT_TOKEN": ""}, clear=False),
+        ):
+            os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+            shared_ok, shared_message = kakera.save(
+                shared, None, vault_notes, vault_attachments, tags=["share/telegram"],
+            )
+        assert not shared_ok, shared_message
+        assert shared_message == "capture saved; Telegram failed: TELEGRAM_BOT_TOKEN is not set", shared_message
+        shared_note = next(vault_notes.glob("*.md")).read_text()
+        assert '\n  - "share/telegram"\n' in shared_note
+        assert '\n  - "image"\n' in shared_note
+        assert list((vault_attachments / "image").glob("image-*-01.jpg"))
+    finally:
+        server.shutdown()
+        server.server_close()

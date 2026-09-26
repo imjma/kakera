@@ -73,7 +73,7 @@ Private Telegram messages to the bot from allowed users. A recognized Source Ser
 _Avoid_: telegram-bot, Telegram Inbox, Telegram queue, Telegram post
 
 **Source Service**:
-The external service associated with a verified Source Post or recognized submitted source. Kakera v0.1 supports Instagram, Twitter (x.com), Reddit, and public RedNote posts.
+The external service associated with a verified Source Post or recognized submitted source. Kakera v0.1 supports Instagram, Twitter (x.com), Reddit, public RedNote posts, and a single image URL whose path ends in jpg, jpeg, png, gif, webp, avif, heic, tif, or tiff.
 _Avoid_: Platform, provider
 
 **Canonical Source URL**:
