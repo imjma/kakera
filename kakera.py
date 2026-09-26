@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -21,9 +22,10 @@ import unicodedata
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+import ipaddress
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 
 ROOT = Path(__file__).resolve().parent
@@ -48,7 +50,12 @@ HTTP_URL = re.compile(r"https?://[^\s<>\[\]\"']+")
 INBOX_WATCH_INTERVAL = 2.0
 TODOIST_WATCH_INTERVAL = 180.0
 TODOIST_API = "https://api.todoist.com/api/v1"
-SOURCE_SERVICES = {"instagram", "twitter", "reddit", "rednote"}
+SOURCE_SERVICES = {"instagram", "twitter", "reddit", "rednote", "image"}
+IMAGE_PATH_SUFFIXES = (
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".heic", ".tif", ".tiff",
+)
+IMAGE_MAX_BYTES = 50 * 1024 * 1024
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 TELEGRAM_API = "https://api.telegram.org"
 TELEGRAM_RECEIPT = "kakera"
 TELEGRAM_TAG = "share/telegram"
@@ -271,11 +278,137 @@ def dedupe_urls(urls: list[str]) -> list[str]:
     return result
 
 
+def _image_path_suffix(url: str) -> bool:
+    path = unquote(urlsplit(url).path).rstrip("/").lower()
+    return path.endswith(IMAGE_PATH_SUFFIXES)
+
+
+def _loopback_host(host: str | None) -> bool:
+    return (host or "").lower() in LOOPBACK_HOSTS
+
+
+def _loopback_http_image(url: str) -> bool:
+    parts = urlsplit(url)
+    return parts.scheme == "http" and _loopback_host(parts.hostname) and _image_path_suffix(url)
+
+
+def _direct_image_url(url: str) -> bool:
+    parts = urlsplit(url)
+    if parts.scheme == "https" and _image_path_suffix(url):
+        return True
+    return _loopback_http_image(url)
+
+
+def _blocked_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (
+        address.is_private or address.is_loopback or address.is_link_local
+        or address.is_multicast or address.is_reserved or address.is_unspecified
+    )
+
+
+def _blocked_resolved_name(host: str) -> bool:
+    try:
+        records = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return True
+    if not records:
+        return True
+    for record in records:
+        text = record[4][0]
+        if isinstance(text, str):
+            text = text.split("%", 1)[0]
+        try:
+            address = ipaddress.ip_address(text)
+        except ValueError:
+            return True
+        if _blocked_ip(address):
+            return True
+    return False
+
+
+def _blocked_redirect_host(host: str | None) -> bool:
+    if _loopback_host(host):
+        return True
+    if not host:
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return _blocked_resolved_name(host)
+    return _blocked_ip(address)
+
+
+class _ImageRedirectHandler(HTTPRedirectHandler):
+    def __init__(self, submitted_host: str):
+        super().__init__()
+        self.submitted_host = submitted_host
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        joined = urljoin(req.full_url, newurl)
+        parts = urlsplit(joined)
+        scheme = parts.scheme.lower()
+        host = (parts.hostname or "").lower()
+        if _loopback_host(self.submitted_host):
+            if scheme != "http" or host != self.submitted_host:
+                raise ValueError("image URL redirected off the local fixture")
+        elif scheme != "https":
+            raise ValueError("image URL redirected to HTTP")
+        elif _blocked_redirect_host(host):
+            raise ValueError("image URL redirected to a private address")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _direct_image_source(url: str, directory: Path, name: str) -> dict:
+    expected = f"image-{hashlib.sha256(canonical_url(url).encode()).hexdigest()[:12]}"
+    if name != expected:
+        raise ValueError("image capture id does not match URL")
+    parts = urlsplit(url)
+    if not _direct_image_url(url):
+        raise ValueError("only HTTPS URLs are supported")
+    if not _loopback_http_image(url) and _blocked_redirect_host((parts.hostname or "").lower()):
+        raise ValueError("image URL points at a private address")
+    directory.mkdir(parents=True, exist_ok=True)
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; Kakera/0.1)"})
+    opener = build_opener(_ImageRedirectHandler((parts.hostname or "").lower()))
+    try:
+        with opener.open(request, timeout=30) as response:
+            data = response.read(IMAGE_MAX_BYTES + 1)
+    except ValueError:
+        raise
+    except (OSError, HTTPError, URLError) as error:
+        raise ValueError(f"image request failed: {error}") from error
+    if len(data) > IMAGE_MAX_BYTES:
+        raise ValueError("image exceeds 50 MB")
+    path = directory / "image.bin"
+    path.write_bytes(data)
+    extension = image_extension(path)
+    if extension is None:
+        path.unlink(missing_ok=True)
+        raise ValueError("no supported images found")
+    stored = directory / f"image{extension}"
+    path.replace(stored)
+    published = published_url(url)
+    stem = Path(unquote(parts.path).rstrip("/")).stem
+    title = stem or expected.split("-", 1)[1]
+    metadata = _normalise_source_metadata(
+        name, "image", {"title": title, "_capture_post_id": expected.split("-", 1)[1]}, published,
+    )
+    return {
+        "name": name,
+        "service": "image",
+        "url": published,
+        "metadata": metadata,
+        "valid": [(stored, extension)],
+    }
+
+
 def capture_id(url: str) -> str:
     parts = urlsplit(url)
     host = (parts.hostname or "").lower()
     rednote_hosts = {"xhslink.com", "www.xhslink.com", "xiaohongshu.com", "www.xiaohongshu.com"}
-    if parts.scheme != "https" and not (parts.scheme == "http" and host in rednote_hosts):
+    if parts.scheme != "https" and not (
+        (parts.scheme == "http" and host in rednote_hosts) or _loopback_http_image(url)
+    ):
         raise ValueError("only HTTPS URLs are supported")
 
     segments = [segment for segment in parts.path.split("/") if segment]
@@ -336,6 +469,9 @@ def capture_id(url: str) -> str:
                     break
         if not post_id:
             raise ValueError("RedNote URL must be an individual note")
+    elif _direct_image_url(url):
+        digest = hashlib.sha256(canonical_url(url).encode()).hexdigest()[:12]
+        return f"image-{digest}"
     else:
         raise ValueError("supported sources are Instagram, Twitter/X, Reddit, and RedNote")
 
@@ -1686,12 +1822,18 @@ def frontmatter_body(text: str) -> str | None:
     return None if closing is None else "\n".join(lines[1:closing])
 
 
+def source_link_property(service: str) -> str:
+    if service == "rednote":
+        return "xhslink"
+    if service in SOURCE_SERVICES:
+        return service
+    return "source"
+
+
 def note_path(notes: Path, name: str, metadata: dict, source: str | None = None) -> Path:
     service, post_id = name.split("-", 1)
     source_url = source or metadata.get("post_url")
-    property_key = "xhslink" if service == "rednote" else service
-    if service not in {"instagram", "twitter", "reddit", "rednote"}:
-        property_key = "source"
+    property_key = source_link_property(service)
     for path in notes.glob("*.md"):
         try:
             text = path.read_text()
@@ -1706,7 +1848,8 @@ def note_path(notes: Path, name: str, metadata: dict, source: str | None = None)
                             except json.JSONDecodeError:
                                 value = ""
                             if isinstance(value, str) and canonical_url(value) == canonical_url(source_url):
-                                return path
+                                if property_key != "image" or _kakera_source_note(text, service):
+                                    return path
                             break
             if f"{name}-" in text:
                 return path
@@ -1786,14 +1929,7 @@ def _strip_yaml_comment(line: str) -> str:
     return line.rstrip()
 
 
-def note_tags(note: Path) -> list[str]:
-    """Read supported YAML tag serializations without loading arbitrary YAML."""
-    try:
-        frontmatter = frontmatter_body(note.read_text())
-    except OSError:
-        return []
-    if frontmatter is None:
-        return []
+def _frontmatter_tag_values(frontmatter: str) -> list[str]:
     lines = frontmatter.splitlines()
     values = []
     for index, raw_line in enumerate(lines):
@@ -1818,8 +1954,37 @@ def note_tags(note: Path) -> list[str]:
                 continue
             break
         break
-    return [tag for tag in normalize_tags(values, warn=True)
+    return values
+
+
+def note_tags(note: Path) -> list[str]:
+    """Read supported YAML tag serializations without loading arbitrary YAML."""
+    try:
+        frontmatter = frontmatter_body(note.read_text())
+    except OSError:
+        return []
+    if frontmatter is None:
+        return []
+    return [tag for tag in normalize_tags(_frontmatter_tag_values(frontmatter), warn=True)
             if tag.casefold() not in SOURCE_SERVICES]
+
+
+def _kakera_source_note(text: str, service: str) -> bool:
+    frontmatter = frontmatter_body(text)
+    if frontmatter is None:
+        return False
+    keys = set()
+    for raw_line in frontmatter.splitlines():
+        line = _strip_yaml_comment(raw_line)
+        if not line or line[0].isspace():
+            continue
+        key, separator, _raw_value = line.partition(":")
+        if separator and key.strip():
+            keys.add(key.strip())
+    if "title" not in keys or "created" not in keys:
+        return False
+    tags = normalize_tags(_frontmatter_tag_values(frontmatter), warn=True)
+    return service.casefold() in {tag.casefold() for tag in tags}
 
 
 def write_atomic_note(note: Path, content: str) -> None:
@@ -1861,7 +2026,7 @@ def write_note(
     )
     if isinstance(post_url, str):
         post_url = published_url(post_url)
-    link_property = "xhslink" if service == "rednote" else service
+    link_property = source_link_property(service)
 
     properties = [
         "---",
@@ -1977,10 +2142,7 @@ def write_composed_note(note: Path, sources: list[dict], tags: list[str]) -> Non
         f"title: {json.dumps(title, ensure_ascii=False)}",
         f"created: {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')}",
     ]
-    if service in {"instagram", "twitter", "reddit", "rednote"}:
-        link_property = "xhslink" if service == "rednote" else service
-    else:
-        link_property = "source"
+    link_property = source_link_property(service)
     properties.append(f"{link_property}: {json.dumps(published_url(primary['url']), ensure_ascii=False)}")
     if primary_ok:
         username = metadata.get("username") or metadata.get("author")
@@ -2194,8 +2356,7 @@ def _write_telegram_receipt(note: Path, original: str, updated: str) -> None:
 
 
 def _telegram_image_url(url: str) -> bool:
-    path = urlsplit(url).path.lower()
-    return path.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".heic", ".tif", ".tiff"))
+    return _image_path_suffix(url)
 
 
 def _telegram_image_index(vault: Path) -> dict[str, list[Path]]:
@@ -2272,7 +2433,7 @@ def _telegram_note_caption(note: Path, text: str, selected_url: str | None = Non
     values, _ = _telegram_frontmatter(text)
     url = selected_url
     if not url:
-        for key in ("source", "instagram", "twitter", "reddit", "xhslink", "url"):
+        for key in ("source", "instagram", "twitter", "reddit", "xhslink", "image", "url"):
             value = values.get(key)
             if isinstance(value, str) and re.match(r"^https?://", value, re.I):
                 url = value
@@ -2603,7 +2764,7 @@ def _telegram_note_candidates(selector: str, notes: Path, vault: Path,
         for path in files:
             values, _ = _telegram_frontmatter(path.read_text())
             for key, value in values.items():
-                if key in {"source", "instagram", "twitter", "reddit", "xhslink", "url"} and isinstance(value, str) and re.match(r"^https?://", value, re.I) and canonical_url(value) == canonical_url(selector):
+                if key in {"source", "instagram", "twitter", "reddit", "xhslink", "image", "url"} and isinstance(value, str) and re.match(r"^https?://", value, re.I) and canonical_url(value) == canonical_url(selector):
                     matches.append(path)
                     break
         return matches, normalize_instagram_post_url(selector) if matches else None
@@ -2874,6 +3035,11 @@ def fetch_source(
             pass
     metadata: dict = {}
     result = None
+    if name.startswith("image-"):
+        try:
+            return _direct_image_source(url, directory, name), None
+        except ValueError as error:
+            return None, str(error)
     if name.startswith("rednote-"):
         try:
             name, metadata = download_rednote(url, directory, include_video=include_video)
@@ -3157,12 +3323,11 @@ def cleanup_empty_attachment_dirs(sources: list[dict], attachment_root: Path) ->
 
 def composed_note_path(notes: Path, primary: dict) -> Path:
     canonical = canonical_url(primary["url"])
-    property_key = {"rednote": "xhslink"}.get(primary["service"], primary["service"])
-    if primary["service"] not in {"instagram", "twitter", "reddit", "rednote"}:
-        property_key = "source"
+    property_key = source_link_property(primary["service"])
     for path in notes.glob("*.md"):
         try:
-            frontmatter = frontmatter_body(path.read_text())
+            text = path.read_text()
+            frontmatter = frontmatter_body(text)
             if frontmatter is None:
                 continue
             for line in frontmatter.splitlines():
@@ -3173,7 +3338,8 @@ def composed_note_path(notes: Path, primary: dict) -> Path:
                     except json.JSONDecodeError:
                         value = ""
                     if isinstance(value, str) and canonical_url(value) == canonical:
-                        return path
+                        if property_key != "image" or _kakera_source_note(text, primary["service"]):
+                            return path
                     break
         except (OSError, ValueError):
             continue
@@ -3252,10 +3418,10 @@ def save_composed(
             if not primary.get("valid"):
                 primary["metadata"] = {"_capture_post_id": primary["name"].split("-", 1)[-1]}
             service_tags = []
-            if primary["service"] in {"instagram", "twitter", "reddit", "rednote"}:
+            if primary["service"] in SOURCE_SERVICES:
                 service_tags.append(primary["service"])
             service_tags.extend(source["service"] for source in sources[1:] if source.get("images")
-                        if source["service"] in {"instagram", "twitter", "reddit", "rednote"})
+                        if source["service"] in SOURCE_SERVICES)
             service_tags = merge_tags(service_tags)
             if not any(source.get("images") for source in sources):
                 cleanup_empty_attachment_dirs(sources, attachment_root)
@@ -3578,8 +3744,8 @@ def watch_inbox(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description=("Save Instagram, Twitter/X, Reddit, and RedNote images as local Captures "
-                     "or publish Telegram Deliveries."),
+        description=("Save Instagram, Twitter/X, Reddit, RedNote, and single image URLs "
+                     "as local Captures or publish Telegram Deliveries."),
         epilog=("Forms: kakera --share telegram URL [URL ...]; "
                 "kakera --compose --share telegram URL [URL ...]; "
                 "kakera share telegram SELECTOR [SELECTOR ...]; "

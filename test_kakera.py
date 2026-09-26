@@ -3767,3 +3767,298 @@ with TemporaryDirectory() as directory:
         assert kakera.watch_inbox(inbox, None, notes, attachments) == 0
     assert inbox_replies == []
     assert inbox_log.getvalue().count("unreadable") == 1
+
+image_url = "https://cdn.example/photos/ridge.jpg?utm_source=x&w=100"
+assert capture_id(image_url) == "image-" + hashlib.sha256(
+    canonical_url(image_url).encode()
+).hexdigest()[:12]
+assert capture_id(image_url) == capture_id("https://cdn.example/photos/ridge.jpg?w=100")
+assert capture_id("https://cdn.example/photos/ridge.JPG").startswith("image-")
+try:
+    capture_id("https://example.com/not-a-post")
+except ValueError as error:
+    assert str(error) == "supported sources are Instagram, Twitter/X, Reddit, and RedNote", error
+else:
+    raise AssertionError("accepted a non-image URL")
+try:
+    capture_id("http://cdn.example/photos/ridge.jpg")
+except ValueError as error:
+    assert str(error) == "only HTTPS URLs are supported", error
+else:
+    raise AssertionError("accepted a public HTTP image URL")
+try:
+    capture_id("https://www.instagram.com/photo.jpg")
+except ValueError as error:
+    assert str(error) == "Instagram URL must be an individual post", error
+else:
+    raise AssertionError("classified an Instagram host as an image URL")
+assert capture_id("http://127.0.0.1/ridge.jpg").startswith("image-")
+
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 20
+
+
+class _ImageFixture(BaseHTTPRequestHandler):
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/off.jpg":
+            self.send_response(302)
+            self.send_header("Location", "http://example.com/ridge.jpg")
+            self.end_headers()
+            return
+        if path == "/go.jpg":
+            self.send_response(302)
+            self.send_header("Location", f"http://{self.headers['Host']}/ridge.jpg")
+            self.end_headers()
+            return
+        if path == "/page.jpg":
+            body = b"<html>not an image</html>"
+        elif path == "/ridge.jpg":
+            body = JPEG
+        else:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format, *_args):
+        return
+
+
+with TemporaryDirectory() as directory:
+    root = Path(directory)
+    notes = root / "notes"
+    attachments = root / "attachments"
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ImageFixture)
+    port = server.server_address[1]
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        ridge = f"http://127.0.0.1:{port}/ridge.jpg"
+        calls = []
+
+        def forbid_gallery(command, **_kwargs):
+            calls.append(command)
+            raise AssertionError(command)
+
+        with patch.object(kakera.subprocess, "run", side_effect=forbid_gallery):
+            ok, message = kakera.save(ridge, None, notes, attachments)
+        assert ok, message
+        assert message == "saved 1 image(s)", message
+        assert calls == []
+        note = next(notes.glob("*.md"))
+        text = note.read_text()
+        assert 'image: "http://127.0.0.1:' in text
+        assert f"{port}/ridge.jpg" in text
+        assert '\n  - "image"\n' in text
+        assert "ridge - Image" in text
+        stored = list((attachments / "image").glob("image-*-01.jpg"))
+        assert len(stored) == 1, stored
+        assert stored[0].read_bytes() == JPEG
+        with patch.object(kakera.subprocess, "run", side_effect=forbid_gallery):
+            again, again_message = kakera.save(ridge, None, notes, attachments)
+        assert again, again_message
+        assert list((attachments / "image").glob("image-*-*.jpg")) == stored
+        page = f"http://127.0.0.1:{port}/page.jpg"
+        failed, failure = kakera.save(page, None, notes, attachments)
+        assert not failed, failure
+        assert failure == "no supported images found", failure
+        assert list(notes.glob("*.md")) == [note]
+        off = f"http://127.0.0.1:{port}/off.jpg"
+        redirected, redirect_message = kakera.fetch_source(
+            off, None, None, None, root / "off", kakera.capture_id(off),
+        )
+        assert redirected is None, redirected
+        assert redirect_message == "image URL redirected off the local fixture", redirect_message
+        gone = f"http://127.0.0.1:{port}/go.jpg"
+        followed, follow_error = kakera.fetch_source(
+            gone, None, None, None, root / "go", kakera.capture_id(gone),
+        )
+        assert follow_error is None, follow_error
+        assert followed["valid"][0][0].read_bytes() == JPEG
+        assert followed["url"] == gone
+        vault = root / "vault"
+        vault_notes = vault / "kakera"
+        vault_attachments = vault / "attachments"
+        config = root / "kakera.json"
+        config.write_text(json.dumps({
+            "browser": "none",
+            "obsidian": {
+                "vault": str(vault),
+                "notes": "kakera",
+                "attachments": "attachments",
+            },
+            "telegram": {"chat_id": "-1001234567890"},
+        }))
+        shared = f"http://127.0.0.1:{port}/ridge.jpg?w=2"
+        with (
+            patch.object(kakera, "CONFIG", config),
+            patch.dict(kakera.os.environ, {"TELEGRAM_BOT_TOKEN": ""}, clear=False),
+        ):
+            os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+            shared_ok, shared_message = kakera.save(
+                shared, None, vault_notes, vault_attachments, tags=["share/telegram"],
+            )
+        assert not shared_ok, shared_message
+        assert shared_message == "capture saved; Telegram failed: TELEGRAM_BOT_TOKEN is not set", shared_message
+        shared_note = next(vault_notes.glob("*.md")).read_text()
+        assert '\n  - "share/telegram"\n' in shared_note
+        assert '\n  - "image"\n' in shared_note
+        assert list((vault_attachments / "image").glob("image-*-01.jpg"))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+with TemporaryDirectory() as directory:
+    notes = Path(directory)
+    cover = "https://cdn.example/cover.jpg"
+    name = capture_id(cover)
+    metadata = {"title": "ridge", "post_url": cover}
+    ordinary = notes / "diary.md"
+    ordinary.write_text(f'---\nimage: "{cover}"\n---\nkeep this\n')
+    tagged_only = notes / "tagged.md"
+    tagged_only.write_text(
+        '---\n'
+        f'image: "{cover}"\n'
+        "tags:\n"
+        '  - "image"\n'
+        "---\n"
+        "still mine\n"
+    )
+    chosen = kakera.note_path(notes, name, metadata, cover)
+    assert chosen not in {ordinary, tagged_only}
+    assert kakera.composed_note_path(
+        notes, {"name": name, "service": "image", "url": cover, "metadata": metadata},
+    ) not in {ordinary, tagged_only}
+    write_note(chosen, cover, [], metadata, "image")
+    written = chosen.read_text()
+    assert 'image: "https://cdn.example/cover.jpg"' in written
+    assert '\n  - "image"\n' in written
+    assert ordinary.read_text().endswith("keep this\n")
+    assert tagged_only.read_text().endswith("still mine\n")
+    assert kakera.note_path(notes, name, metadata, cover) == chosen
+    assert kakera.composed_note_path(
+        notes, {"name": name, "service": "image", "url": cover, "metadata": metadata},
+    ) == chosen
+
+with TemporaryDirectory() as directory:
+    root = Path(directory)
+    notes = root / "notes"
+    notes.mkdir()
+    image_note = notes / "ridge.md"
+    stored = "https://cdn.example/ridge.jpg?utm_source=x"
+    selector = "https://cdn.example/ridge.jpg"
+    image_note.write_text(f'---\nimage: "{stored}"\n---\n')
+    matches, selected = kakera._telegram_note_candidates(selector, notes, root)
+    assert matches == [image_note.resolve()], matches
+    assert selected == selector
+
+def _deny_image_dns(*_args, **_kwargs):
+    raise AssertionError("resolved DNS for an image host")
+
+def _deny_image_open(*_args, **_kwargs):
+    raise AssertionError("opened an image URL")
+
+with TemporaryDirectory() as directory:
+    root = Path(directory)
+    blocked = (
+        "https://10.0.0.5/private.jpg",
+        "https://169.254.169.254/link.jpg",
+        "https://127.0.0.1/loop.jpg",
+        "https://240.0.0.1/reserved.jpg",
+        "https://[::1]/loop.jpg",
+    )
+    with (
+        patch.object(kakera.socket, "getaddrinfo", side_effect=_deny_image_dns),
+        patch.object(kakera, "build_opener", side_effect=_deny_image_open),
+    ):
+        for blocked_url in blocked:
+            found, error = kakera.fetch_source(
+                blocked_url, None, None, None, root / "blocked", capture_id(blocked_url),
+            )
+            assert found is None
+            assert error == "image URL points at a private address", (blocked_url, error)
+
+    class _FixtureAdmitted:
+        def open(self, request, timeout=30):
+            assert request.full_url == "http://127.0.0.1/ridge.jpg"
+            raise kakera.URLError("fixture admitted")
+
+    with (
+        patch.object(kakera.socket, "getaddrinfo", side_effect=_deny_image_dns),
+        patch.object(kakera, "build_opener", return_value=_FixtureAdmitted()),
+    ):
+        found, error = kakera.fetch_source(
+            "http://127.0.0.1/ridge.jpg", None, None, None, root / "fixture",
+            capture_id("http://127.0.0.1/ridge.jpg"),
+        )
+    assert found is None
+    assert error == "image request failed: <urlopen error fixture admitted>", error
+
+    def _private_dns(host, *_args, **_kwargs):
+        assert host == "internal.example"
+        return [(kakera.socket.AF_INET, kakera.socket.SOCK_STREAM, 6, "", ("10.0.0.5", 0))]
+
+    with (
+        patch.object(kakera.socket, "getaddrinfo", side_effect=_private_dns),
+        patch.object(kakera, "build_opener", side_effect=_deny_image_open),
+    ):
+        found, error = kakera.fetch_source(
+            "https://internal.example/ridge.jpg", None, None, None, root / "dns",
+            capture_id("https://internal.example/ridge.jpg"),
+        )
+    assert found is None
+    assert error == "image URL points at a private address", error
+
+    def _public_dns(host, *_args, **_kwargs):
+        assert host == "cdn.example"
+        return [(kakera.socket.AF_INET, kakera.socket.SOCK_STREAM, 6, "", ("8.8.8.8", 0))]
+
+    class _Admitted:
+        def open(self, request, timeout=30):
+            raise kakera.URLError("admitted")
+
+    with (
+        patch.object(kakera.socket, "getaddrinfo", side_effect=_public_dns),
+        patch.object(kakera, "build_opener", return_value=_Admitted()),
+    ):
+        found, error = kakera.fetch_source(
+            "https://cdn.example/ridge.jpg", None, None, None, root / "public",
+            capture_id("https://cdn.example/ridge.jpg"),
+        )
+    assert found is None
+    assert error == "image request failed: <urlopen error admitted>", error
+
+    handler = kakera._ImageRedirectHandler("cdn.example")
+    request = kakera.Request("https://cdn.example/ridge.jpg")
+    with patch.object(kakera.socket, "getaddrinfo", side_effect=_deny_image_dns):
+        for private_target in (
+            "https://10.0.0.5/secret.jpg",
+            "https://169.254.169.254/latest.jpg",
+            "https://127.0.0.1/secret.jpg",
+            "https://240.0.0.1/secret.jpg",
+        ):
+            try:
+                handler.redirect_request(request, None, 302, "Found", {}, private_target)
+            except ValueError as error:
+                assert str(error) == "image URL redirected to a private address", (private_target, error)
+            else:
+                raise AssertionError(private_target)
+    with patch.object(kakera.socket, "getaddrinfo", side_effect=_private_dns):
+        try:
+            handler.redirect_request(
+                request, None, 302, "Found", {}, "https://internal.example/secret.jpg",
+            )
+        except ValueError as error:
+            assert str(error) == "image URL redirected to a private address", error
+        else:
+            raise AssertionError("allowed a redirect that resolves to a private address")
+    with patch.object(kakera.socket, "getaddrinfo", side_effect=_public_dns):
+        followed = handler.redirect_request(
+            request, None, 302, "Found", {}, "https://cdn.example/other.jpg",
+        )
+    assert followed.full_url == "https://cdn.example/other.jpg"
